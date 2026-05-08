@@ -1,3 +1,4 @@
 anthropic
 flask
 httpx
+pdf2image
