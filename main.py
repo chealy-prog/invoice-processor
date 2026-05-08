@@ -15,7 +15,7 @@ def process_invoice():
     file_base64 = base64.standard_b64encode(file_response.content).decode('utf-8')
 
     client = anthropic.Anthropic(api_key=api_key)
-    message = client.messages.create(
+    message = client.beta.messages.create(
         model="claude-opus-4-5",
         max_tokens=2000,
         betas=["pdfs-2024-09-25"],
