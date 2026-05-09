@@ -53,9 +53,10 @@ Rules:
 - Detail Location: always {location_code}
 
 Before returning the CSV, verify every single row by checking:
-1. Read the Qty carefully — do not confuse 14 with 1, 24 with 2, etc. Multi-digit numbers are common.
-2. Multiply Qty × Unit Price and confirm it equals Total. If it does not match, re-read the row from the image and correct it.
-3. If a value is unclear or illegible, flag it by appending a ? to that field.
+1. Read the Qty carefully — quantities are often 2 digits. Look at the Total to verify: if Total is much larger than Unit Price, the Qty must be more than 1. For example if Unit Price is $21.99 and Total is $671.76, the Qty must be 24, not 1.
+2. Cross-check every row: Qty × Unit Price must equal Total. If it does not match exactly, re-read both the Qty and Total from the image and correct whichever is wrong.
+3. Pay special attention to quantities like 14, 24, 10 — these are easy to misread as 1, 2, or 1.
+4. If a value is unclear or illegible, flag it by appending a ? to that field.
 
 Return only the verified CSV rows, no header row, no explanation, no markdown."""
                 }
