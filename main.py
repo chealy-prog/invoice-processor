@@ -2,19 +2,19 @@ import anthropic
 import base64
 import httpx
 from flask import Flask, request, jsonify
- 
+
 app = Flask(__name__)
- 
+
 @app.route('/process', methods=['POST'])
 def process_invoice():
     data = request.json
     file_url = data.get('file_url')
     api_key = data.get('api_key')
     location_code = data.get('location_code', '')
- 
+
     file_response = httpx.get(file_url)
     file_base64 = base64.standard_b64encode(file_response.content).decode('utf-8')
- 
+
     client = anthropic.Anthropic(api_key=api_key)
     message = client.beta.messages.create(
         model="claude-opus-4-5",
@@ -34,9 +34,9 @@ def process_invoice():
                 {
                     "type": "text",
                     "text": f"""Extract all line items from this invoice and return them as a CSV with exactly these columns in this order:
- 
+
 Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location
- 
+
 Rules:
 - Vendor: always "VA ABC"
 - Location: always {location_code}
@@ -48,18 +48,22 @@ Rules:
 - Qty: quantity ordered, formatted as X.00
 - Unit Price: unit price without $ sign
 - Total: total amount without $ sign
-- Image URL: leave blank
+- Image URL: {file_url}
 - Break Flag: always N
 - Detail Location: always {location_code}
- 
-Return only the CSV rows, no header row, no explanation, no markdown."""
+
+Before returning the CSV, verify every single row by checking:
+1. Read the Qty carefully — do not confuse 14 with 1, 24 with 2, etc. Multi-digit numbers are common.
+2. Multiply Qty × Unit Price and confirm it equals Total. If it does not match, re-read the row from the image and correct it.
+3. If a value is unclear or illegible, flag it by appending a ? to that field.
+
+Return only the verified CSV rows, no header row, no explanation, no markdown."""
                 }
             ]
         }]
     )
- 
+
     return jsonify({"result": message.content[0].text})
- 
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
- 
