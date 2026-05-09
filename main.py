@@ -2,22 +2,22 @@ import anthropic
 import base64
 import httpx
 from flask import Flask, request, jsonify
-
+ 
 app = Flask(__name__)
-
+ 
 @app.route('/process', methods=['POST'])
 def process_invoice():
     data = request.json
     file_url = data.get('file_url')
     api_key = data.get('api_key')
     location_code = data.get('location_code', '')
-
+ 
     file_response = httpx.get(file_url)
     file_base64 = base64.standard_b64encode(file_response.content).decode('utf-8')
-
+ 
     client = anthropic.Anthropic(api_key=api_key)
     message = client.beta.messages.create(
-        model="claude-opus-4-5",
+        model="claude-sonnet-4-6",
         max_tokens=2000,
         betas=["pdfs-2024-09-25"],
         messages=[{
@@ -34,9 +34,9 @@ def process_invoice():
                 {
                     "type": "text",
                     "text": f"""Extract all line items from this invoice and return them as a CSV with exactly these columns in this order:
-
+ 
 Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location
-
+ 
 Rules:
 - Vendor: always "VA ABC"
 - Location: always {location_code}
@@ -48,23 +48,18 @@ Rules:
 - Qty: quantity ordered, formatted as X.00
 - Unit Price: unit price without $ sign
 - Total: total amount without $ sign
-- Image URL: {file_url}
+- Image URL: leave blank
 - Break Flag: always N
 - Detail Location: always {location_code}
-
-Before returning the CSV, verify every single row by checking:
-1. Read the Qty carefully — quantities are often 2 digits. Look at the Total to verify: if Total is much larger than Unit Price, the Qty must be more than 1. For example if Unit Price is $21.99 and Total is $671.76, the Qty must be 24, not 1.
-2. Cross-check every row: Qty × Unit Price must equal Total. If it does not match exactly, re-read both the Qty and Total from the image and correct whichever is wrong.
-3. Pay special attention to quantities like 14, 24, 10 — these are easy to misread as 1, 2, or 1.
-4. If a value is unclear or illegible, flag it by appending a ? to that field.
-
-Return only the verified CSV rows, no header row, no explanation, no markdown."""
+ 
+Return only the CSV rows, no header row, no explanation, no markdown."""
                 }
             ]
         }]
     )
-
+ 
     return jsonify({"result": message.content[0].text})
-
+ 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
+
