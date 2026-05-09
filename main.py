@@ -1,9 +1,16 @@
 import anthropic
 import base64
 import httpx
+import ftplib
+import io
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+
+FTP_HOST = 'connect.restaurant365.net'
+FTP_USER = 'housepitality'
+FTP_PASS = 'H@usePR365!'
+FTP_DIR = '/housepitality/APIImports/R365'
 
 def validate_and_fix_csv(csv_text, invoice_total=None):
     lines = csv_text.strip().split('\n')
@@ -13,6 +20,10 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
 
     for line in lines:
         if not line.strip():
+            continue
+        # Skip header row
+        if line.startswith('Vendor,'):
+            fixed_lines.append(line)
             continue
         cols = line.split(',')
         if len(cols) < 13:
@@ -49,6 +60,13 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
             pass
 
     return '\n'.join(fixed_lines), flagged
+
+def upload_to_ftp(filename, content):
+    ftp = ftplib.FTP(FTP_HOST)
+    ftp.login(FTP_USER, FTP_PASS)
+    ftp.cwd(FTP_DIR)
+    ftp.storbinary(f'STOR {filename}', io.BytesIO(content.encode('utf-8')))
+    ftp.quit()
 
 @app.route('/process', methods=['POST'])
 def process_invoice():
@@ -151,8 +169,28 @@ Return only the CSV rows and the GRAND_TOTAL line. No explanation. No markdown. 
     csv_text = '\n'.join(csv_lines)
     fixed_csv, flagged = validate_and_fix_csv(csv_text, invoice_total)
 
+    # Build filename from document number and date
+    try:
+        first_data_line = [l for l in fixed_csv.split('\n') if l and not l.startswith('Vendor,')][0]
+        cols = first_data_line.split(',')
+        doc_number = cols[2].strip()
+        date = cols[3].strip().replace('/', '')
+        filename = f"VABC_{doc_number}_{date}.csv"
+    except Exception:
+        filename = f"VABC_invoice.csv"
+
+    # Upload to FTP
+    ftp_status = "success"
+    try:
+        upload_to_ftp(filename, fixed_csv)
+    except Exception as e:
+        ftp_status = f"FTP error: {str(e)}"
+        flagged.append(ftp_status)
+
     return jsonify({
         "result": fixed_csv,
+        "filename": filename,
+        "ftp_status": ftp_status,
         "flagged": flagged,
         "invoice_total": invoice_total
     })
