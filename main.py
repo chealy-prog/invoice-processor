@@ -5,6 +5,39 @@ from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
+def validate_and_fix_csv(csv_text):
+    lines = csv_text.strip().split('\n')
+    fixed_lines = []
+    flagged = []
+
+    for line in lines:
+        if not line.strip():
+            continue
+        cols = line.split(',')
+        if len(cols) < 13:
+            flagged.append(f"SHORT ROW: {line}")
+            fixed_lines.append(line)
+            continue
+
+        try:
+            qty = float(cols[7])
+            unit_price = float(cols[8])
+            total = float(cols[9])
+            expected = round(qty * unit_price, 2)
+
+            if abs(expected - total) > 0.02:
+                # Try to fix by recalculating qty
+                correct_qty = round(total / unit_price, 2)
+                flagged.append(f"MATH ERROR fixed: {cols[5]} qty {qty} -> {correct_qty} (expected {expected} got {total})")
+                cols[7] = f"{correct_qty:.2f}"
+                line = ','.join(cols)
+        except (ValueError, ZeroDivisionError):
+            flagged.append(f"PARSE ERROR: {line}")
+
+        fixed_lines.append(line)
+
+    return '\n'.join(fixed_lines), flagged
+
 @app.route('/process', methods=['POST'])
 def process_invoice():
     data = request.json
@@ -68,7 +101,13 @@ Return only the CSV rows. No header. No explanation. No markdown."""
         }]
     )
 
-    return jsonify({"result": message.content[0].text})
+    raw_csv = message.content[0].text
+    fixed_csv, flagged = validate_and_fix_csv(raw_csv)
+
+    return jsonify({
+        "result": fixed_csv,
+        "flagged": flagged
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
