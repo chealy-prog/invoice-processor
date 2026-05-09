@@ -21,7 +21,6 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
     for line in lines:
         if not line.strip():
             continue
-        # Skip header row
         if line.startswith('Vendor,'):
             fixed_lines.append(line)
             continue
@@ -62,8 +61,12 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
     return '\n'.join(fixed_lines), flagged
 
 def upload_to_ftp(filename, content):
-    ftp = ftplib.FTP(FTP_HOST)
+    ftp = ftplib.FTP()
+    ftp.connect(FTP_HOST, 21)
     ftp.login(FTP_USER, FTP_PASS)
+    ftp.set_pasv(True)
+    print('Root:', ftp.pwd())
+    print('Listing:', ftp.nlst())
     ftp.cwd(FTP_DIR)
     ftp.storbinary(f'STOR {filename}', io.BytesIO(content.encode('utf-8')))
     ftp.quit()
@@ -169,7 +172,6 @@ Return only the CSV rows and the GRAND_TOTAL line. No explanation. No markdown. 
     csv_text = '\n'.join(csv_lines)
     fixed_csv, flagged = validate_and_fix_csv(csv_text, invoice_total)
 
-    # Build filename from document number and date
     try:
         first_data_line = [l for l in fixed_csv.split('\n') if l and not l.startswith('Vendor,')][0]
         cols = first_data_line.split(',')
@@ -179,7 +181,6 @@ Return only the CSV rows and the GRAND_TOTAL line. No explanation. No markdown. 
     except Exception:
         filename = f"VABC_invoice.csv"
 
-    # Upload to FTP
     ftp_status = "success"
     try:
         upload_to_ftp(filename, fixed_csv)
