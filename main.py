@@ -10,7 +10,7 @@ app = Flask(__name__)
 FTP_HOST = 'connect.restaurant365.net'
 FTP_USER = 'housepitality'
 FTP_PASS = 'H@usePR365!'
-FTP_DIR = '/housepitality/APImports/R365/Unprocessed'
+FTP_DIR = '/housepitality/APImports/R365'
 
 # Numbers that are commonly misread as each other in scanned/photographed documents
 COMMON_MISREADS = {
