@@ -37,7 +37,6 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
 
         fixed_lines.append(line)
 
-    # Check against invoice grand total
     if invoice_total:
         try:
             expected_total = float(invoice_total)
@@ -79,36 +78,41 @@ def process_invoice():
                 },
                 {
                     "type": "text",
-                    "text": f"""This document is a photo or scan of a printed invoice. The image quality may vary — it could be perfectly flat, slightly angled, shadowy, or low resolution.
+                    "text": f"""This document is a photo or scan of a printed invoice table. Image quality may vary.
 
-STEP 1 — EXTRACT EACH COLUMN VERTICALLY:
-Before building any rows, read each column independently from top to bottom:
-- Read ALL product codes top to bottom
-- Read ALL product names top to bottom
-- Read ALL sizes top to bottom
-- Read ALL quantities top to bottom
-- Read ALL unit prices top to bottom
-- Read ALL totals top to bottom
+YOU MUST FOLLOW THESE STEPS IN ORDER. DO NOT SKIP ANY STEP.
 
-This prevents misalignment between columns caused by image distortion.
+STEP 1 — READ PRODUCT CODES COLUMN ONLY:
+Look only at the leftmost column. Read every product code from top to bottom, one per line. List them all before doing anything else. There should be 40+ codes.
 
-STEP 2 — BUILD ROWS:
-Combine the columns into rows. For each row verify: Qty × Unit Price = Total.
-If they don't match, re-read that specific row from the image and correct it.
-Use Total ÷ Unit Price to calculate correct Qty if needed.
+STEP 2 — READ PRODUCT NAMES COLUMN ONLY:
+Look only at the product name column. Read every product name from top to bottom. List them all.
 
-STEP 3 — VERIFY GRAND TOTAL:
-Find the grand total at the bottom of the invoice.
-Sum all your line item totals and confirm they match the grand total.
-If they don't match, find and fix the discrepancy before returning.
+STEP 3 — READ ORDER QTY COLUMN ONLY:
+Look only at the Order Qty column. Read every quantity from top to bottom. List them all. These are often 2-digit numbers like 14, 24, 10.
 
-STEP 4 — RETURN RESULTS:
-Return the data as a CSV with exactly these columns in this order:
+STEP 4 — READ UNIT PRICE COLUMN ONLY:
+Look only at the Unit Price column. Read every unit price from top to bottom. List them all.
+
+STEP 5 — READ TOTAL AMOUNT COLUMN ONLY:
+Look only at the Total Amount column. Read every total from top to bottom. List them all.
+
+STEP 6 — READ GRAND TOTAL:
+Find the grand total at the bottom of the last page. Record it.
+
+STEP 7 — COMBINE INTO ROWS:
+Match each product code with its corresponding name, qty, unit price, and total by position (1st code matches 1st name matches 1st qty etc).
+For every row verify: Qty × Unit Price = Total.
+If they don't match, use Total ÷ Unit Price to get the correct Qty.
+
+STEP 8 — VERIFY GRAND TOTAL:
+Sum all Total values. Confirm they match the grand total from Step 6.
+If they don't match, find and fix the discrepancy.
+
+STEP 9 — OUTPUT CSV:
+Return the data as a CSV with exactly these columns:
 
 Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location
-
-Then on the very last line return the grand total like this:
-GRAND_TOTAL:1234.56
 
 Column rules:
 - Vendor: always VA ABC
@@ -125,7 +129,10 @@ Column rules:
 - Break Flag: always N
 - Detail Location: always {location_code}
 
-Return only the CSV rows plus the GRAND_TOTAL line. No header. No explanation. No markdown."""
+After the last CSV row add this line:
+GRAND_TOTAL:[the grand total number only, no $ sign]
+
+Return only the CSV rows and the GRAND_TOTAL line. No explanation. No markdown. No column lists from the intermediate steps."""
                 }
             ]
         }]
@@ -133,7 +140,6 @@ Return only the CSV rows plus the GRAND_TOTAL line. No header. No explanation. N
 
     raw_output = message.content[0].text
 
-    # Extract grand total if present
     invoice_total = None
     csv_lines = []
     for line in raw_output.strip().split('\n'):
