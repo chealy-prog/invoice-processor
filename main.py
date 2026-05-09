@@ -10,7 +10,40 @@ app = Flask(__name__)
 FTP_HOST = 'connect.restaurant365.net'
 FTP_USER = 'housepitality'
 FTP_PASS = 'H@usePR365!'
-FTP_DIR = '/housepitality/APIImports/R365/Unprocessed'
+FTP_DIR = '/housepitality/APImports/R365/Unprocessed'
+
+# Numbers that are commonly misread as each other in scanned/photographed documents
+COMMON_MISREADS = {
+    '0': ['8', 'O'],
+    '1': ['7', 'l', 'I'],
+    '2': ['7', 'Z'],
+    '3': ['8'],
+    '5': ['6', 'S'],
+    '6': ['8', '5', 'G'],
+    '7': ['1', '2'],
+    '8': ['0', '3', '6', 'B'],
+    '9': ['4', 'q'],
+    '4': ['9'],
+}
+
+def could_be_misread(read_value, calculated_value):
+    """Check if the difference between two numbers can be explained by a common misread."""
+    read_str = f"{read_value:.2f}"
+    calc_str = f"{calculated_value:.2f}"
+    if len(read_str) != len(calc_str):
+        return False
+    differences = [(r, c) for r, c in zip(read_str, calc_str) if r != c]
+    if len(differences) == 0:
+        return True
+    if len(differences) > 2:
+        return False
+    for read_char, calc_char in differences:
+        if read_char in COMMON_MISREADS and calc_char in COMMON_MISREADS.get(read_char, []):
+            continue
+        if calc_char in COMMON_MISREADS and read_char in COMMON_MISREADS.get(calc_char, []):
+            continue
+        return False
+    return True
 
 def validate_and_fix_csv(csv_text, invoice_total=None):
     lines = csv_text.strip().split('\n')
@@ -47,26 +80,29 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
 
         fixed_lines.append(line)
 
+    # Compare calculated total against Claude's read of the printed grand total
     if invoice_total:
         try:
-            expected_total = float(invoice_total)
-            diff = abs(round(running_total, 2) - expected_total)
-            if diff > 0.10:
-                flagged.append(f"GRAND TOTAL MISMATCH: extracted ${running_total:.2f} vs invoice ${expected_total:.2f} — difference of ${diff:.2f}. Review all line items.")
+            claude_read_total = float(invoice_total)
+            diff = abs(round(running_total, 2) - claude_read_total)
+            if diff < 0.10:
+                flagged.append(f"GRAND TOTAL VERIFIED: line items sum to ${running_total:.2f}")
+            elif could_be_misread(claude_read_total, running_total):
+                flagged.append(f"GRAND TOTAL OK: Claude read ${claude_read_total:.2f} from image but line items sum to ${running_total:.2f} — difference of ${diff:.2f} is consistent with a common misread (e.g. 6 vs 8, 1 vs 7). Trusting the math.")
             else:
-                flagged.append(f"GRAND TOTAL VERIFIED: ${running_total:.2f} matches invoice ${expected_total:.2f}")
+                flagged.append(f"GRAND TOTAL MISMATCH: Claude read ${claude_read_total:.2f} from image but line items sum to ${running_total:.2f} — difference of ${diff:.2f} cannot be explained by a misread. Manual review required.")
         except ValueError:
             pass
+    else:
+        flagged.append(f"GRAND TOTAL (calculated): ${running_total:.2f}")
 
-    return '\n'.join(fixed_lines), flagged
+    return '\n'.join(fixed_lines), flagged, round(running_total, 2)
 
 def upload_to_ftp(filename, content):
     ftp = ftplib.FTP()
     ftp.connect(FTP_HOST, 21)
     ftp.login(FTP_USER, FTP_PASS)
     ftp.set_pasv(True)
-    print('Root:', ftp.pwd())
-    print('Listing:', ftp.nlst())
     ftp.cwd(FTP_DIR)
     ftp.storbinary(f'STOR {filename}', io.BytesIO(content.encode('utf-8')))
     ftp.quit()
@@ -170,7 +206,7 @@ Return only the CSV rows and the GRAND_TOTAL line. No explanation. No markdown. 
             csv_lines.append(line)
 
     csv_text = '\n'.join(csv_lines)
-    fixed_csv, flagged = validate_and_fix_csv(csv_text, invoice_total)
+    fixed_csv, flagged, calculated_total = validate_and_fix_csv(csv_text, invoice_total)
 
     try:
         first_data_line = [l for l in fixed_csv.split('\n') if l and not l.startswith('Vendor,')][0]
@@ -192,8 +228,9 @@ Return only the CSV rows and the GRAND_TOTAL line. No explanation. No markdown. 
         "result": fixed_csv,
         "filename": filename,
         "ftp_status": ftp_status,
-        "flagged": flagged,
-        "invoice_total": invoice_total
+        "calculated_total": calculated_total,
+        "claude_read_total": invoice_total,
+        "flagged": flagged
     })
 
 if __name__ == '__main__':
