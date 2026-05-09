@@ -4,6 +4,7 @@ import httpx
 import ftplib
 import io
 from flask import Flask, request, jsonify
+from datetime import datetime
 
 app = Flask(__name__)
 
@@ -13,17 +14,41 @@ FTP_PASS = 'H@usePR365!'
 FTP_DIR = '/housepitality/APImports/R365'
 
 COMMON_MISREADS = {
-    '0': ['8', 'O'],
-    '1': ['7', 'l', 'I'],
+    '0': ['8', 'O', 'D'],
+    '1': ['7', 'l', 'I', 'i'],
     '2': ['7', 'Z'],
-    '3': ['8'],
-    '5': ['6', 'S'],
-    '6': ['8', '5', 'G'],
-    '7': ['1', '2'],
-    '8': ['0', '3', '6', 'B'],
-    '9': ['4', 'q'],
-    '4': ['9'],
+    '3': ['8', 'B'],
+    '4': ['9', 'A'],
+    '5': ['6', 'S', '$'],
+    '6': ['8', '5', 'G', 'b'],
+    '7': ['1', '2', 'T'],
+    '8': ['0', '3', '6', 'B', 'S'],
+    '9': ['4', 'q', 'g'],
 }
+
+DIGIT_AMBIGUITY_GUIDE = """
+DIGIT AMBIGUITY REFERENCE LIST:
+When a digit is unclear, use context (math, surrounding digits) to resolve it.
+Common confusions in scanned/photographed/thermal printed documents:
+
+0 vs 8: 0 is a clean oval. 8 has two loops. A gap or break in an oval = still 8, not 0.
+0 vs O: Always use 0 in numeric fields, never the letter O.
+1 vs 7: 1 is straight vertical. 7 has a horizontal top bar. If there's a serif or top bar = 7.
+1 vs l/I: In numeric fields, always use 1, never lowercase l or uppercase I.
+2 vs 7: 2 curves at the bottom. 7 is angular. Look for the curve.
+3 vs 8: 3 is open on the left. 8 is closed. A slightly open or malformed 8 = still 8.
+3 vs B: In numeric fields, always use 3, never B.
+4 vs 9: 4 has an open top. 9 is closed at top. Look for the closed loop.
+5 vs 6: 5 has a flat top. 6 has a curved top that closes into a loop.
+5 vs S: In numeric fields, always use 5, never S.
+6 vs 8: 6 has one loop at bottom. 8 has two loops. Count the loops.
+6 vs G: In numeric fields, always use 6, never G.
+7 vs 2: 7 is angular with no curve at bottom. 2 curves at bottom.
+8 vs 0: See 0 vs 8 above. A broken or gapped oval with two sections = 8.
+8 vs B: In numeric fields, always use 8, never B.
+9 vs 4: 9 is closed at top like a loop. 4 is open at top.
+9 vs g/q: In numeric fields, always use 9, never g or q.
+"""
 
 def could_be_misread(read_value, calculated_value):
     read_str = f"{read_value:.2f}"
@@ -111,6 +136,7 @@ def process_invoice():
     file_url = data.get('file_url')
     api_key = data.get('api_key')
     location_code = data.get('location_code', '')
+    upload_date = datetime.now().strftime('%-m/%-d/%Y')
 
     file_response = httpx.get(file_url)
     file_base64 = base64.standard_b64encode(file_response.content).decode('utf-8')
@@ -133,36 +159,42 @@ def process_invoice():
                 },
                 {
                     "type": "text",
-                    "text": f"""This document is a photo or scan of a printed invoice table. Image quality may vary.
+                    "text": f"""This document is a photo or scan of a printed invoice or receipt from Virginia ABC. Image quality may vary — it could be a multi-page order invoice or a single-page thermal printer receipt. Handle both formats.
+
+{DIGIT_AMBIGUITY_GUIDE}
+
+When reading any number, consult the ambiguity guide above. If a digit looks unusual, use the guide to resolve it before recording the value. Always verify your reading using the math: Qty × Unit Price = Total.
 
 YOU MUST FOLLOW THESE STEPS IN ORDER. DO NOT SKIP ANY STEP.
 
 STEP 1 — READ PRODUCT CODES COLUMN ONLY:
-Look only at the leftmost column. Read every product code from top to bottom, one per line. List them all before doing anything else. There should be 40+ codes.
+Look only at the product code / Item / GTIN column. Read every product code from top to bottom. Use the digit ambiguity guide to resolve any unclear digits. List them all.
 
 STEP 2 — READ PRODUCT NAMES COLUMN ONLY:
 Look only at the product name column. Read every product name from top to bottom. List them all.
 
 STEP 3 — READ ORDER QTY COLUMN ONLY:
-Look only at the Order Qty column. Read every quantity from top to bottom. List them all. These are often 2-digit numbers like 14, 24, 10.
+Look only at the Order Qty column. Read every quantity from top to bottom. Use the digit ambiguity guide. These are often 2-digit numbers like 14, 24, 10. List them all.
 
 STEP 4 — READ UNIT PRICE COLUMN ONLY:
-Look only at the Unit Price column. Read every unit price from top to bottom. List them all.
+Look only at the Unit Price column. Read every unit price from top to bottom. Use the digit ambiguity guide. List them all.
 
 STEP 5 — READ TOTAL AMOUNT COLUMN ONLY:
-Look only at the Total Amount column. Read every total from top to bottom. List them all.
+Look only at the Total Amount column. Read every total from top to bottom. Use the digit ambiguity guide. List them all.
 
-STEP 6 — READ GRAND TOTAL:
-Find the grand total at the bottom of the last page. Record it.
+STEP 6 — READ DATE AND GRAND TOTAL:
+Find the date and grand total. If no date is present on the document, use today's date: {upload_date}.
+Record the grand total from the document.
 
 STEP 7 — COMBINE INTO ROWS:
-Match each product code with its corresponding name, qty, unit price, and total by position (1st code matches 1st name matches 1st qty etc).
+Match each product code with its corresponding name, qty, unit price, and total by position.
 For every row verify: Qty × Unit Price = Total.
-If they don't match, use Total ÷ Unit Price to get the correct Qty.
+If they don't match, consult the digit ambiguity guide and re-read the ambiguous digits.
+Use Total ÷ Unit Price to calculate correct Qty if needed.
 
 STEP 8 — VERIFY GRAND TOTAL:
-Sum all Total values. Confirm they match the grand total from Step 6.
-If they don't match, find and fix the discrepancy.
+Sum all Total values. Confirm they match the grand total.
+If they don't match, use the digit ambiguity guide to find and fix the misread digit.
 
 STEP 9 — OUTPUT CSV:
 Return the data as a CSV with exactly these columns:
@@ -172,9 +204,9 @@ Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qt
 Column rules:
 - Vendor: always VA ABC
 - Location: always {location_code}
-- Document Number: order number from the invoice
-- Date: pickup date in M/D/YYYY format
-- Vendor Item Number: product code
+- Document Number: order number or receipt number from the document
+- Date: date from the document in M/D/YYYY format, or {upload_date} if no date found
+- Vendor Item Number: product code or GTIN number
 - Vendor Item Name: product name in lowercase
 - UofM: Bottle for 750ml, Liter for 1L, Each for anything else
 - Qty: formatted as X.00
