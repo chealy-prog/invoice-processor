@@ -12,7 +12,6 @@ FTP_USER = 'housepitality'
 FTP_PASS = 'H@usePR365!'
 FTP_DIR = '/housepitality/APImports/R365'
 
-# Numbers that are commonly misread as each other in scanned/photographed documents
 COMMON_MISREADS = {
     '0': ['8', 'O'],
     '1': ['7', 'l', 'I'],
@@ -27,7 +26,6 @@ COMMON_MISREADS = {
 }
 
 def could_be_misread(read_value, calculated_value):
-    """Check if the difference between two numbers can be explained by a common misread."""
     read_str = f"{read_value:.2f}"
     calc_str = f"{calculated_value:.2f}"
     if len(read_str) != len(calc_str):
@@ -50,12 +48,13 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
     fixed_lines = []
     flagged = []
     running_total = 0.0
+    header = 'Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location'
 
     for line in lines:
         if not line.strip():
             continue
         if line.startswith('Vendor,'):
-            fixed_lines.append(line)
+            fixed_lines.append(header)
             continue
         cols = line.split(',')
         if len(cols) < 13:
@@ -80,7 +79,6 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
 
         fixed_lines.append(line)
 
-    # Compare calculated total against Claude's read of the printed grand total
     if invoice_total:
         try:
             claude_read_total = float(invoice_total)
@@ -88,7 +86,7 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
             if diff < 0.10:
                 flagged.append(f"GRAND TOTAL VERIFIED: line items sum to ${running_total:.2f}")
             elif could_be_misread(claude_read_total, running_total):
-                flagged.append(f"GRAND TOTAL OK: Claude read ${claude_read_total:.2f} from image but line items sum to ${running_total:.2f} — difference of ${diff:.2f} is consistent with a common misread (e.g. 6 vs 8, 1 vs 7). Trusting the math.")
+                flagged.append(f"GRAND TOTAL OK: Claude read ${claude_read_total:.2f} from image but line items sum to ${running_total:.2f} — difference of ${diff:.2f} is consistent with a common misread. Trusting the math.")
             else:
                 flagged.append(f"GRAND TOTAL MISMATCH: Claude read ${claude_read_total:.2f} from image but line items sum to ${running_total:.2f} — difference of ${diff:.2f} cannot be explained by a misread. Manual review required.")
         except ValueError:
@@ -213,9 +211,9 @@ Return only the CSV rows and the GRAND_TOTAL line. No explanation. No markdown. 
         cols = first_data_line.split(',')
         doc_number = cols[2].strip()
         date = cols[3].strip().replace('/', '')
-        filename = f"VABC_{doc_number}_{date}.csv"
+        filename = f"Colin_Export_VABC_{doc_number}_{date}.csv"
     except Exception:
-        filename = f"VABC_invoice.csv"
+        filename = f"Colin_Export_VABC_invoice.csv"
 
     ftp_status = "success"
     try:
