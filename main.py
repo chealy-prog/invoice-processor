@@ -10,7 +10,7 @@ app = Flask(__name__)
 FTP_HOST = 'connect.restaurant365.net'
 FTP_USER = 'housepitality'
 FTP_PASS = 'H@usePR365!'
-FTP_DIR = '/housepitality/APIImports/R365'
+FTP_DIR = '/housepitality/APIImports/R365/Unprocessed'
 
 def validate_and_fix_csv(csv_text, invoice_total=None):
     lines = csv_text.strip().split('\n')
