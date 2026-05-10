@@ -138,32 +138,26 @@ def prepare_images(pdf_bytes):
         else:
             result['pages'].append(img_to_b64(img, quality=90))
 
-        # Only crop on single page or first page
         if page_num == 0:
             top = int(h * 0.10)
             bottom = int(h * 0.95)
 
-            # Product codes column (left ~15%)
             codes = img.crop((0, top, int(w * 0.15), bottom))
             codes = codes.resize((codes.width * 3, codes.height * 3), Image.LANCZOS)
             result['crops']['codes'] = img_to_b64(codes, quality=97)
 
-            # Product names column (15-55%)
             names = img.crop((int(w * 0.15), top, int(w * 0.55), bottom))
             names = names.resize((names.width * 2, names.height * 2), Image.LANCZOS)
             result['crops']['names'] = img_to_b64(names, quality=90)
 
-            # Qty column (~55-65%)
             qty = img.crop((int(w * 0.55), top, int(w * 0.65), bottom))
             qty = qty.resize((qty.width * 4, qty.height * 4), Image.LANCZOS)
             result['crops']['qty'] = img_to_b64(qty, quality=97)
 
-            # Unit price column (~65-80%)
             price = img.crop((int(w * 0.65), top, int(w * 0.80), bottom))
             price = price.resize((price.width * 4, price.height * 4), Image.LANCZOS)
             result['crops']['price'] = img_to_b64(price, quality=97)
 
-            # Total column (~80-100%)
             total = img.crop((int(w * 0.80), top, w, bottom))
             total = total.resize((total.width * 4, total.height * 4), Image.LANCZOS)
             result['crops']['total'] = img_to_b64(total, quality=97)
@@ -173,12 +167,23 @@ def prepare_images(pdf_bytes):
 def claude_call(client, images, prompt):
     content = []
     for img in images:
-        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img}})
+        content.append({
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": img}
+        })
     content.append({"type": "text", "text": prompt})
     msg = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=2048,
         messages=[{"role": "user", "content": content}]
+    )
+    return msg.content[0].text.strip()
+
+def claude_text_call(client, prompt):
+    msg = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=4096,
+        messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}]
     )
     return msg.content[0].text.strip()
 
@@ -293,53 +298,63 @@ def process_invoice():
             pages = imgs['pages']
             crops = imgs['crops']
 
-            # CALL 1: Get product codes from high-res crop
-            codes_text = claude_call(client, [crops['codes']], f"""This is a high-resolution crop of the PRODUCT CODE column from a Virginia ABC invoice.
+            # CALL 1: Product codes
+            codes_text = claude_call(
+                client,
+                [crops['codes']],
+                f"""This is a high-resolution crop of the PRODUCT CODE column from a Virginia ABC invoice.
 {DIGIT_AMBIGUITY_GUIDE}
 {reference_list}
-Read every product code from top to bottom. Return only a numbered list like:
+Read every product code from top to bottom. Return only a numbered list:
 1. 011297
 2. 015626
-...
-No explanation. Numbers only.""")
+No explanation. Numbers only."""
+            )
 
-            # CALL 2: Get product names from full page
-            names_text = claude_call(client, pages, f"""This is a Virginia ABC invoice.
+            # CALL 2: Product names
+            names_text = claude_call(
+                client,
+                pages,
+                """This is a Virginia ABC invoice.
 Read every product name from top to bottom in the same order as the product codes.
-Return only a numbered list like:
+Return only a numbered list:
 1. crown royal whisky
 2. jameson irish whiskey
-...
-No explanation. Names in lowercase only.""")
+No explanation. Names in lowercase only."""
+            )
 
-            # CALL 3: Get quantities from high-res crop
-            qty_text = claude_call(client, [crops['qty']], f"""This is a high-resolution crop of the ORDER QTY column from a Virginia ABC invoice.
+            # CALL 3: Quantities
+            qty_text = claude_call(
+                client,
+                [crops['qty']],
+                f"""This is a high-resolution crop of the ORDER QTY column from a Virginia ABC invoice.
 {DIGIT_AMBIGUITY_GUIDE}
 Quantities are often 2 digits: 10, 14, 24 are common. Read carefully.
-Return only a numbered list like:
+Return only a numbered list:
 1. 2
 2. 1
-...
-No explanation. Numbers only.""")
+No explanation. Numbers only."""
+            )
 
-            # CALL 4: Get unit prices and totals from high-res crops
-            prices_text = claude_call(client, [crops['price'], crops['total']], f"""These are high-resolution crops of the UNIT PRICE column and TOTAL AMOUNT column from a Virginia ABC invoice.
+            # CALL 4: Unit prices and totals
+            prices_text = claude_call(
+                client,
+                [crops['price'], crops['total']],
+                f"""These are high-resolution crops of the UNIT PRICE and TOTAL AMOUNT columns from a Virginia ABC invoice.
 {DIGIT_AMBIGUITY_GUIDE}
 Return two numbered lists:
 UNIT PRICES:
 1. 38.99
 2. 27.99
-...
 TOTALS:
 1. 77.98
 2. 27.99
-...
-Also include the grand total at the end like: GRAND_TOTAL:5763.74
-No explanation. Numbers only.""")
+Also include: GRAND_TOTAL:5763.74
+No explanation. Numbers only."""
+            )
 
-            # CALL 5: Merge everything into CSV
-            merge_prompt = f"""You are merging data from a Virginia ABC invoice that was read in separate passes.
-Here is the data from each pass:
+            # CALL 5: Merge and output CSV (text only, no images)
+            merge_prompt = f"""You are merging data from a Virginia ABC invoice read in separate passes.
 
 PRODUCT CODES:
 {codes_text}
@@ -358,16 +373,16 @@ UNIT PRICES AND TOTALS:
 Instructions:
 - Match row 1 code with row 1 name with row 1 qty with row 1 price with row 1 total, etc.
 - For every row verify: Qty × Unit Price = Total. If they don't match, use Total ÷ Unit Price to correct Qty.
-- Find the document number and date from the data if mentioned, otherwise use today: {upload_date}
+- Find document number and date from the data if mentioned, otherwise use: {upload_date}
 
 Return as CSV with these exact columns:
 Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location
 
-Column rules:
+Rules:
 - Vendor: always VA ABC
 - Location: always {location_code}
 - Document Number: order/receipt number
-- Date: M/D/YYYY format or {upload_date}
+- Date: M/D/YYYY or {upload_date}
 - Vendor Item Number: product code
 - Vendor Item Name: product name in lowercase
 - UofM: Bottle for 750ml, Liter for 1L, Each for anything else
@@ -381,27 +396,25 @@ Column rules:
 After last row add: GRAND_TOTAL:[number only]
 Return only CSV rows and GRAND_TOTAL. No explanation. No markdown."""
 
-            final_text = claude_call(client, [], merge_prompt) if False else client.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=4096,
-                messages=[{"role": "user", "content": [{"type": "text", "text": merge_prompt}]}]
-            ).content[0].text.strip()
+            final_text = claude_text_call(client, merge_prompt)
 
         except Exception as e:
             print(f"Multi-call failed: {e}, falling back to PDF beta")
             file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
-            final_text = client.beta.messages.create(
+            msg = client.beta.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4096,
                 betas=["pdfs-2024-09-25"],
                 messages=[{"role": "user", "content": [
                     {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": file_base64}},
-                    {"type": "text", "text": f"Extract all line items as CSV: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location. Vendor=VA ABC, Location={location_code}, Image URL={file_url}, Break Flag=N, Detail Location={location_code}. Add GRAND_TOTAL at end."}
+                    {"type": "text", "text": f"Extract all line items as CSV with columns: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location. Vendor=VA ABC, Location={location_code}, Image URL={file_url}, Break Flag=N, Detail Location={location_code}, Date={upload_date} if not found. Add GRAND_TOTAL at end. No markdown."}
                 ]}
-            ).content[0].text.strip()
+            )
+            final_text = msg.content[0].text.strip()
+
     else:
         file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
-        final_text = client.messages.create(
+        msg = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
             messages=[{"role": "user", "content": [
@@ -411,9 +424,10 @@ Return only CSV rows and GRAND_TOTAL. No explanation. No markdown."""
 {reference_list}
 Columns: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location
 Rules: Vendor=VA ABC, Location={location_code}, Date={upload_date} if not found, Image URL={file_url}, Break Flag=N, Detail Location={location_code}
-Add GRAND_TOTAL:[number] at end. No header. No explanation."""}
+Add GRAND_TOTAL:[number] at end. No header. No explanation. No markdown."""}
             ]}
-        ).content[0].text.strip()
+        )
+        final_text = msg.content[0].text.strip()
 
     invoice_total = None
     csv_lines = []
