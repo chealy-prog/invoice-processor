@@ -3,11 +3,11 @@ import base64
 import httpx
 import ftplib
 import io
-import os
 import psycopg2
 from flask import Flask, request, jsonify
 from datetime import datetime
 from pdf2image import convert_from_bytes
+from PIL import Image
 
 app = Flask(__name__)
 
@@ -132,11 +132,15 @@ def build_reference_list(known_items):
     return '\n'.join(lines)
 
 def pdf_to_high_res_images(pdf_bytes):
-    images = convert_from_bytes(pdf_bytes, dpi=300)
+    Image.MAX_IMAGE_PIXELS = None
+    images = convert_from_bytes(pdf_bytes, dpi=150)
     result = []
     for img in images:
+        max_dimension = 2000
+        if img.width > max_dimension or img.height > max_dimension:
+            img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
         buf = io.BytesIO()
-        img.save(buf, format='JPEG', quality=95)
+        img.save(buf, format='JPEG', quality=85)
         b64 = base64.standard_b64encode(buf.getvalue()).decode('utf-8')
         result.append(b64)
     return result
@@ -221,7 +225,6 @@ def upload_to_ftp(filename, content):
     ftp.storbinary(f'STOR {filename}', io.BytesIO(content.encode('utf-8')))
     ftp.quit()
 
-# Initialize DB on startup
 with app.app_context():
     try:
         init_db()
@@ -240,13 +243,11 @@ def process_invoice():
     file_bytes = file_response.content
     content_type = file_response.headers.get('content-type', '')
 
-    # Get known items from database for reference
     known_items = get_known_items()
     reference_list = build_reference_list(known_items)
 
-    # Convert PDF to high-res images
     is_pdf = 'pdf' in content_type or file_url.lower().endswith('.pdf')
-    
+
     if is_pdf:
         try:
             images = pdf_to_high_res_images(file_bytes)
@@ -261,8 +262,7 @@ def process_invoice():
                     }
                 })
         except Exception as e:
-            # Fall back to PDF beta if image conversion fails
-            print(f"Image conversion failed, falling back to PDF: {e}")
+            print(f"Image conversion failed, falling back to PDF beta: {e}")
             file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
             content_blocks = [{
                 "type": "document",
@@ -311,7 +311,7 @@ STEP 5 — READ TOTAL AMOUNT COLUMN ONLY:
 Read every total top to bottom. Use the digit ambiguity guide.
 
 STEP 6 — READ DATE AND GRAND TOTAL:
-Find the date and grand total. If no date is present, use today's date: {upload_date}.
+Find the date and grand total. If no date is present on the document, use today's date: {upload_date}.
 
 STEP 7 — COMBINE INTO ROWS:
 Match each product code with its name, qty, unit price, and total by position.
@@ -372,7 +372,6 @@ Return only the CSV rows and the GRAND_TOTAL line. No explanation. No markdown. 
     csv_text = '\n'.join(csv_lines)
     fixed_csv, flagged, calculated_total = validate_and_fix_csv(csv_text, invoice_total)
 
-    # Update database with successfully processed items
     update_items_db(fixed_csv)
 
     try:
