@@ -3,6 +3,7 @@ import base64
 import httpx
 import ftplib
 import io
+import json
 import psycopg2
 from flask import Flask, request, jsonify
 from datetime import datetime
@@ -122,49 +123,21 @@ def img_to_b64(img, quality=90):
     img.save(buf, format='JPEG', quality=quality)
     return base64.standard_b64encode(buf.getvalue()).decode('utf-8')
  
-def prepare_images(pdf_bytes):
+def prepare_pages(pdf_bytes):
     Image.MAX_IMAGE_PIXELS = None
     images = convert_from_bytes(pdf_bytes, dpi=200)
     num_pages = len(images)
-    result = {'pages': [], 'crops': {}}
- 
-    for page_num, img in enumerate(images):
-        w, h = img.size
- 
+    pages = []
+    for img in images:
         if num_pages > 1:
             thumb = img.copy()
             thumb.thumbnail((1600, 1600), Image.LANCZOS)
-            result['pages'].append(img_to_b64(thumb, quality=75))
+            pages.append((img_to_b64(thumb, quality=75), thumb.size))
         else:
-            result['pages'].append(img_to_b64(img, quality=90))
+            pages.append((img_to_b64(img, quality=90), img.size))
+    return images, pages
  
-        if page_num == 0:
-            top = int(h * 0.10)
-            bottom = int(h * 0.95)
- 
-            codes = img.crop((0, top, int(w * 0.15), bottom))
-            codes = codes.resize((codes.width * 3, codes.height * 3), Image.LANCZOS)
-            result['crops']['codes'] = img_to_b64(codes, quality=97)
- 
-            names = img.crop((int(w * 0.15), top, int(w * 0.55), bottom))
-            names = names.resize((names.width * 2, names.height * 2), Image.LANCZOS)
-            result['crops']['names'] = img_to_b64(names, quality=90)
- 
-            qty = img.crop((int(w * 0.55), top, int(w * 0.65), bottom))
-            qty = qty.resize((qty.width * 4, qty.height * 4), Image.LANCZOS)
-            result['crops']['qty'] = img_to_b64(qty, quality=97)
- 
-            price = img.crop((int(w * 0.65), top, int(w * 0.80), bottom))
-            price = price.resize((price.width * 4, price.height * 4), Image.LANCZOS)
-            result['crops']['price'] = img_to_b64(price, quality=97)
- 
-            total = img.crop((int(w * 0.80), top, w, bottom))
-            total = total.resize((total.width * 4, total.height * 4), Image.LANCZOS)
-            result['crops']['total'] = img_to_b64(total, quality=97)
- 
-    return result
- 
-def claude_call(client, images, prompt):
+def claude_call(client, images, prompt, max_tokens=2048):
     content = []
     for img in images:
         content.append({
@@ -174,15 +147,15 @@ def claude_call(client, images, prompt):
     content.append({"type": "text", "text": prompt})
     msg = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=2048,
+        max_tokens=max_tokens,
         messages=[{"role": "user", "content": content}]
     )
     return msg.content[0].text.strip()
  
-def claude_text_call(client, prompt):
+def claude_text_call(client, prompt, max_tokens=4096):
     msg = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=4096,
+        max_tokens=max_tokens,
         messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}]
     )
     return msg.content[0].text.strip()
@@ -294,70 +267,155 @@ def process_invoice():
  
     if is_pdf:
         try:
-            imgs = prepare_images(file_bytes)
-            pages = imgs['pages']
-            crops = imgs['crops']
+            raw_images, pages = prepare_pages(file_bytes)
+            page_b64s = [p[0] for p in pages]
  
-            codes_prompt = DIGIT_AMBIGUITY_GUIDE + "\n" + reference_list + """
+            # CALL 1: Detect column boundaries
+            detect_prompt = """This is a Virginia ABC invoice or receipt image.
+I need to crop specific columns for high-resolution reading.
+The image dimensions are: """ + str(raw_images[0].size[0]) + "x" + str(raw_images[0].size[1]) + """ pixels.
  
-This is a high-resolution crop of the PRODUCT CODE column from a Virginia ABC invoice.
-Read every product code from top to bottom. Return only a numbered list:
+Please identify the pixel boundaries of these columns in the FIRST page:
+- product_code: the column containing item/product codes (6-digit numbers)
+- product_name: the column containing product names
+- qty: the column containing order quantities
+- unit_price: the column containing unit prices
+- total: the column containing total amounts
+- data_top: the y pixel where data rows start (after header)
+- data_bottom: the y pixel where data rows end (before footer/totals)
+ 
+Return ONLY a JSON object like this:
+{
+  "product_code": {"x1": 50, "x2": 150},
+  "product_name": {"x1": 155, "x2": 400},
+  "qty": {"x1": 405, "x2": 480},
+  "unit_price": {"x1": 485, "x2": 580},
+  "total": {"x1": 585, "x2": 700},
+  "data_top": 120,
+  "data_bottom": 900
+}
+ 
+Return only the JSON. No explanation."""
+ 
+            bounds_text = claude_call(client, [page_b64s[0]], detect_prompt, max_tokens=500)
+ 
+            # Parse bounds
+            try:
+                # Strip any markdown
+                bounds_text = bounds_text.replace('```json', '').replace('```', '').strip()
+                bounds = json.loads(bounds_text)
+            except Exception as e:
+                print(f"Bounds parse error: {e}, using fallback")
+                bounds = {
+                    "product_code": {"x1": 0, "x2": 150},
+                    "product_name": {"x1": 150, "x2": 500},
+                    "qty": {"x1": 500, "x2": 580},
+                    "unit_price": {"x1": 580, "x2": 700},
+                    "total": {"x1": 700, "x2": 850},
+                    "data_top": 100,
+                    "data_bottom": int(raw_images[0].size[1] * 0.92)
+                }
+ 
+            img = raw_images[0]
+            w, h = img.size
+            top = max(0, bounds.get('data_top', int(h * 0.10)))
+            bottom = min(h, bounds.get('data_bottom', int(h * 0.95)))
+ 
+            def make_crop(col_key, scale=3):
+                col = bounds.get(col_key, {})
+                x1 = max(0, col.get('x1', 0))
+                x2 = min(w, col.get('x2', w))
+                crop = img.crop((x1, top, x2, bottom))
+                crop = crop.resize((crop.width * scale, crop.height * scale), Image.LANCZOS)
+                return img_to_b64(crop, quality=97)
+ 
+            codes_b64 = make_crop('product_code', scale=4)
+            names_b64 = make_crop('product_name', scale=2)
+            qty_b64 = make_crop('qty', scale=4)
+            price_b64 = make_crop('unit_price', scale=4)
+            total_b64 = make_crop('total', scale=4)
+ 
+            # CALL 2: Product codes
+            codes_text = claude_call(
+                client,
+                [codes_b64],
+                DIGIT_AMBIGUITY_GUIDE + "\n" + reference_list + """
+ 
+This is a high-resolution crop of ONLY the product code column from a Virginia ABC invoice.
+Read every product code from top to bottom.
+Return only a numbered list:
 1. 011297
 2. 015626
-No explanation. Numbers only."""
+No explanation. No extra text."""
+            )
  
-            codes_text = claude_call(client, [crops['codes']], codes_prompt)
- 
-            names_text = claude_call(client, pages, """This is a Virginia ABC invoice.
-Read every product name from top to bottom in the same order as the product codes.
-Return only a numbered list:
+            # CALL 3: Product names + doc info
+            names_text = claude_call(
+                client,
+                [page_b64s[0]],
+                """This is a Virginia ABC invoice or receipt.
+Read every product name from top to bottom.
+Also find: document/order number, and date (if present).
+Return:
+DOCUMENT_NUMBER: [number]
+DATE: [date or NONE]
+NAMES:
 1. crown royal whisky
 2. jameson irish whiskey
-No explanation. Names in lowercase only.""")
+No explanation."""
+            )
  
-            qty_prompt = DIGIT_AMBIGUITY_GUIDE + """
+            # CALL 4: Quantities
+            qty_text = claude_call(
+                client,
+                [qty_b64],
+                DIGIT_AMBIGUITY_GUIDE + """
  
-This is a high-resolution crop of the ORDER QTY column from a Virginia ABC invoice.
-Quantities are often 2 digits: 10, 14, 24 are common. Read carefully.
+This is a high-resolution crop of ONLY the order quantity column from a Virginia ABC invoice.
+Quantities are often multi-digit: 10, 14, 24 are common. Read every digit carefully.
 Return only a numbered list:
 1. 2
-2. 1
+2. 14
 No explanation. Numbers only."""
+            )
  
-            qty_text = claude_call(client, [crops['qty']], qty_prompt)
+            # CALL 5: Prices and totals
+            prices_text = claude_call(
+                client,
+                [price_b64, total_b64],
+                DIGIT_AMBIGUITY_GUIDE + """
  
-            prices_prompt = DIGIT_AMBIGUITY_GUIDE + """
- 
-These are high-resolution crops of the UNIT PRICE and TOTAL AMOUNT columns from a Virginia ABC invoice.
-Return two numbered lists:
+These are high-resolution crops of the UNIT PRICE column and TOTAL AMOUNT column from a Virginia ABC invoice.
+Return:
 UNIT PRICES:
 1. 38.99
-2. 27.99
+2. 31.99
 TOTALS:
 1. 77.98
-2. 27.99
-Also include: GRAND_TOTAL:5763.74
+2. 447.86
+GRAND_TOTAL: 5763.74
 No explanation. Numbers only."""
+            )
  
-            prices_text = claude_call(client, [crops['price'], crops['total']], prices_prompt)
- 
+            # Build merge prompt
             merge_prompt = "You are merging data from a Virginia ABC invoice read in separate passes.\n\n"
             merge_prompt += "PRODUCT CODES:\n" + codes_text + "\n\n"
-            merge_prompt += "PRODUCT NAMES:\n" + names_text + "\n\n"
+            merge_prompt += "NAMES AND DOCUMENT INFO:\n" + names_text + "\n\n"
             merge_prompt += "QUANTITIES:\n" + qty_text + "\n\n"
             merge_prompt += "UNIT PRICES AND TOTALS:\n" + prices_text + "\n\n"
             merge_prompt += reference_list + "\n\n"
             merge_prompt += "Instructions:\n"
             merge_prompt += "- Match row 1 code with row 1 name with row 1 qty with row 1 price with row 1 total, etc.\n"
-            merge_prompt += "- For every row verify: Qty x Unit Price = Total. If they don't match, use Total / Unit Price to correct Qty.\n"
-            merge_prompt += "- Find document number and date from the data if mentioned, otherwise use: " + upload_date + "\n\n"
+            merge_prompt += "- For every row verify: Qty x Unit Price = Total. If they do not match, use Total divided by Unit Price to correct Qty.\n"
+            merge_prompt += "- Extract document number and date from NAMES AND DOCUMENT INFO above.\n"
+            merge_prompt += "- If date is NONE, use: " + upload_date + "\n\n"
             merge_prompt += "Return as CSV with these exact columns:\n"
             merge_prompt += "Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n\n"
             merge_prompt += "Rules:\n"
             merge_prompt += "- Vendor: always VA ABC\n"
             merge_prompt += "- Location: always " + str(location_code) + "\n"
-            merge_prompt += "- Document Number: order/receipt number\n"
-            merge_prompt += "- Date: M/D/YYYY or " + upload_date + "\n"
+            merge_prompt += "- Document Number: from invoice\n"
+            merge_prompt += "- Date: M/D/YYYY format\n"
             merge_prompt += "- Vendor Item Number: product code\n"
             merge_prompt += "- Vendor Item Name: product name in lowercase\n"
             merge_prompt += "- UofM: Bottle for 750ml, Liter for 1L, Each for anything else\n"
@@ -368,7 +426,7 @@ No explanation. Numbers only."""
             merge_prompt += "- Break Flag: always N\n"
             merge_prompt += "- Detail Location: always " + str(location_code) + "\n\n"
             merge_prompt += "After last row add: GRAND_TOTAL:[number only]\n"
-            merge_prompt += "Return only CSV rows and GRAND_TOTAL. No explanation. No markdown."
+            merge_prompt += "Return only CSV rows and GRAND_TOTAL line. No header. No explanation. No markdown."
  
             final_text = claude_text_call(client, merge_prompt)
  
@@ -381,7 +439,7 @@ No explanation. Numbers only."""
                 betas=["pdfs-2024-09-25"],
                 messages=[{"role": "user", "content": [
                     {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": file_base64}},
-                    {"type": "text", "text": "Extract all line items as CSV with columns: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location. Vendor=VA ABC, Location=" + str(location_code) + ", Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + ", Date=" + upload_date + " if not found. Add GRAND_TOTAL at end. No markdown."}
+                    {"type": "text", "text": "Extract all line items as CSV: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location. Vendor=VA ABC, Location=" + str(location_code) + ", Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + ", Date=" + upload_date + " if not found. Add GRAND_TOTAL at end. No markdown."}
                 ]}]
             )
             final_text = msg.content[0].text.strip()
@@ -445,4 +503,5 @@ No explanation. Numbers only."""
  
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
+ 
  
