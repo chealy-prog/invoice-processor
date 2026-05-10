@@ -132,63 +132,39 @@ def build_reference_list(known_items):
         lines.append(f"  {code} | {item['name']} | ${item['price']:.2f} | {item['uom']} | Confidence: {confidence} (seen {item['count']}x)")
     return '\n'.join(lines)
 
-def img_to_b64(img, quality=95):
+def img_to_b64(img, quality=90):
     buf = io.BytesIO()
     img.save(buf, format='JPEG', quality=quality)
     return base64.standard_b64encode(buf.getvalue()).decode('utf-8')
 
 def pdf_to_images_with_crops(pdf_bytes):
     Image.MAX_IMAGE_PIXELS = None
-    images = convert_from_bytes(pdf_bytes, dpi=200)
+    images = convert_from_bytes(pdf_bytes, dpi=150)
     num_pages = len(images)
     result = []
 
     for page_num, img in enumerate(images):
-        # Resize multi-page docs but keep single page receipts full res
-        if num_pages > 1:
-            max_dimension = 2000
-            if img.width > max_dimension or img.height > max_dimension:
-                img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
-
         w, h = img.size
 
-        # Full page image
-        full_b64 = img_to_b64(img, quality=90)
-        result.append({
-            'type': 'full',
-            'page': page_num + 1,
-            'b64': full_b64
-        })
+        if num_pages > 1:
+            # Multi-page invoice: resize and send full page only, no crops
+            max_dimension = 1800
+            if img.width > max_dimension or img.height > max_dimension:
+                img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
+            result.append({'type': 'full', 'page': page_num + 1, 'b64': img_to_b64(img, quality=80)})
+        else:
+            # Single page receipt: full res + high-res crops
+            result.append({'type': 'full', 'page': page_num + 1, 'b64': img_to_b64(img, quality=90)})
 
-        # Crop product code column (leftmost ~15% of page, skip top 10% header)
-        code_crop = img.crop((
-            int(w * 0.00),  # left edge
-            int(h * 0.10),  # skip header
-            int(w * 0.15),  # right edge of code column
-            int(h * 0.95)   # bottom
-        ))
-        # Scale up 2x for clarity
-        code_crop = code_crop.resize((code_crop.width * 2, code_crop.height * 2), Image.LANCZOS)
-        result.append({
-            'type': 'codes',
-            'page': page_num + 1,
-            'b64': img_to_b64(code_crop, quality=98)
-        })
+            # Product code crop (left 20%, skip top 10%)
+            code_crop = img.crop((0, int(h * 0.10), int(w * 0.20), int(h * 0.95)))
+            code_crop = code_crop.resize((code_crop.width * 2, code_crop.height * 2), Image.LANCZOS)
+            result.append({'type': 'codes', 'page': page_num + 1, 'b64': img_to_b64(code_crop, quality=95)})
 
-        # Crop qty + unit price + total columns (rightmost ~35% of page)
-        numbers_crop = img.crop((
-            int(w * 0.65),  # left edge of numbers area
-            int(h * 0.10),  # skip header
-            int(w * 1.00),  # right edge
-            int(h * 0.95)   # bottom
-        ))
-        # Scale up 2x for clarity
-        numbers_crop = numbers_crop.resize((numbers_crop.width * 2, numbers_crop.height * 2), Image.LANCZOS)
-        result.append({
-            'type': 'numbers',
-            'page': page_num + 1,
-            'b64': img_to_b64(numbers_crop, quality=98)
-        })
+            # Numbers crop (right 40%)
+            numbers_crop = img.crop((int(w * 0.60), int(h * 0.10), w, int(h * 0.95)))
+            numbers_crop = numbers_crop.resize((numbers_crop.width * 2, numbers_crop.height * 2), Image.LANCZOS)
+            result.append({'type': 'numbers', 'page': page_num + 1, 'b64': img_to_b64(numbers_crop, quality=95)})
 
     return result
 
@@ -299,8 +275,9 @@ def process_invoice():
     if is_pdf:
         try:
             page_images = pdf_to_images_with_crops(file_bytes)
+            num_pages = max(item['page'] for item in page_images)
 
-            # Send full pages first
+            # Always send full pages first
             for item in page_images:
                 if item['type'] == 'full':
                     content_blocks.append({
@@ -308,29 +285,29 @@ def process_invoice():
                         "source": {"type": "base64", "media_type": "image/jpeg", "data": item['b64']}
                     })
 
-            # Then send cropped code columns with label
-            content_blocks.append({
-                "type": "text",
-                "text": "The following are high-resolution crops of the PRODUCT CODE column only — use these to read product codes accurately:"
-            })
-            for item in page_images:
-                if item['type'] == 'codes':
-                    content_blocks.append({
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": "image/jpeg", "data": item['b64']}
-                    })
+            # For single page receipts, also send crops
+            if num_pages == 1:
+                content_blocks.append({
+                    "type": "text",
+                    "text": "The following is a high-resolution crop of the PRODUCT CODE column — use this to read product codes accurately:"
+                })
+                for item in page_images:
+                    if item['type'] == 'codes':
+                        content_blocks.append({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": "image/jpeg", "data": item['b64']}
+                        })
 
-            # Then send cropped numbers columns with label
-            content_blocks.append({
-                "type": "text",
-                "text": "The following are high-resolution crops of the QTY, UNIT PRICE, and TOTAL columns — use these to read numbers accurately:"
-            })
-            for item in page_images:
-                if item['type'] == 'numbers':
-                    content_blocks.append({
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": "image/jpeg", "data": item['b64']}
-                    })
+                content_blocks.append({
+                    "type": "text",
+                    "text": "The following is a high-resolution crop of the QTY, UNIT PRICE, and TOTAL columns — use this to read numbers accurately:"
+                })
+                for item in page_images:
+                    if item['type'] == 'numbers':
+                        content_blocks.append({
+                            "type": "image",
+                            "source": {"type": "base64", "media_type": "image/jpeg", "data": item['b64']}
+                        })
 
         except Exception as e:
             print(f"Image conversion failed, falling back to PDF beta: {e}")
@@ -348,12 +325,7 @@ def process_invoice():
 
     content_blocks.append({
         "type": "text",
-        "text": f"""This document is a photo or scan of a printed invoice or receipt from Virginia ABC. You have been provided:
-1. The full page image(s) for context
-2. High-resolution crops of the product code column
-3. High-resolution crops of the qty/price/total columns
-
-Use the high-resolution crops to read numbers and codes accurately. Use the full page for context and row alignment.
+        "text": f"""This document is a photo or scan of a printed invoice or receipt from Virginia ABC. Image quality may vary — it could be a multi-page order invoice or a single-page thermal printer receipt. Handle both formats.
 
 {DIGIT_AMBIGUITY_GUIDE}
 
@@ -364,22 +336,22 @@ When reading any number, consult the ambiguity guide above. If a digit looks unu
 YOU MUST FOLLOW THESE STEPS IN ORDER. DO NOT SKIP ANY STEP.
 
 STEP 1 — READ PRODUCT CODES:
-Use the high-resolution product code crop. Read every code top to bottom. Use the digit ambiguity guide. Cross-reference with the known items database.
+Use the high-resolution product code crop if provided, otherwise use the full page. Read every code top to bottom. Use the digit ambiguity guide. Cross-reference with the known items database.
 
 STEP 2 — READ PRODUCT NAMES:
 Use the full page image. Read every product name top to bottom.
 
 STEP 3 — READ ORDER QTY:
-Use the high-resolution numbers crop. Read every quantity top to bottom. These are often 2-digit numbers like 14, 24, 10.
+Use the high-resolution numbers crop if provided, otherwise use the full page. Read every quantity top to bottom. These are often 2-digit numbers like 14, 24, 10.
 
 STEP 4 — READ UNIT PRICE:
-Use the high-resolution numbers crop. Read every unit price top to bottom. Cross-reference with the known items database.
+Use the high-resolution numbers crop if provided. Read every unit price top to bottom. Cross-reference with the known items database — if a price differs significantly from the known price, re-read it carefully.
 
 STEP 5 — READ TOTAL AMOUNT:
-Use the high-resolution numbers crop. Read every total top to bottom.
+Use the high-resolution numbers crop if provided. Read every total top to bottom.
 
 STEP 6 — READ DATE AND GRAND TOTAL:
-Find the date and grand total. If no date is present, use today's date: {upload_date}.
+Find the date and grand total. If no date is present on the document, use today's date: {upload_date}.
 
 STEP 7 — COMBINE INTO ROWS:
 Match each product code with its name, qty, unit price, and total by position.
@@ -389,6 +361,7 @@ Use Total ÷ Unit Price to calculate correct Qty if needed.
 
 STEP 8 — VERIFY GRAND TOTAL:
 Sum all Total values. Confirm they match the grand total.
+If they don't match, use the digit ambiguity guide to find and fix the misread digit.
 
 STEP 9 — OUTPUT CSV:
 Return the data as a CSV with exactly these columns:
