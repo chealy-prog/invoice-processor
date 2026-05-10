@@ -32,27 +32,13 @@ COMMON_MISREADS = {
 
 DIGIT_AMBIGUITY_GUIDE = """
 DIGIT AMBIGUITY REFERENCE LIST:
-When a digit is unclear, use context (math, surrounding digits) to resolve it.
-Common confusions in scanned/photographed/thermal printed documents:
-
-0 vs 8: 0 is a clean oval. 8 has two loops. A gap or break in an oval = still 8, not 0.
-0 vs O: Always use 0 in numeric fields, never the letter O.
-1 vs 7: 1 is straight vertical. 7 has a horizontal top bar. If there's a serif or top bar = 7.
-1 vs l/I: In numeric fields, always use 1, never lowercase l or uppercase I.
-2 vs 7: 2 curves at the bottom. 7 is angular. Look for the curve.
-3 vs 8: 3 is open on the left. 8 is closed. Even a slightly malformed 8 will have TWO loops or bumps. If you see any hint of a second loop, it is 8 not 3.
-3 vs B: In numeric fields, always use 3, never B.
-4 vs 9: 4 has an open top. 9 is closed at top. Look for the closed loop.
-5 vs 6: 5 has a flat top. 6 has a curved top that closes into a loop.
-5 vs S: In numeric fields, always use 5, never S.
-6 vs 8: 6 has one loop at bottom. 8 has two loops. Count the loops.
-6 vs G: In numeric fields, always use 6, never G.
-7 vs 2: 7 is angular with no curve at bottom. 2 curves at bottom.
-8 vs 0: A broken or gapped oval with two sections = 8. Look for the pinch or crossing in the middle.
-8 vs 3: 8 is CLOSED on both sides. 3 is OPEN on the left. If both sides are closed = 8.
-8 vs B: In numeric fields, always use 8, never B.
-9 vs 4: 9 is closed at top like a loop. 4 is open at top.
-9 vs g/q: In numeric fields, always use 9, never g or q.
+0 vs 8: 0 is a clean oval. 8 has two loops. A gap in an oval = still 8.
+1 vs 7: 1 is straight. 7 has a horizontal top bar.
+3 vs 8: 3 is OPEN on the left. 8 is CLOSED on both sides. Any hint of two bumps = 8.
+4 vs 9: 4 has open top. 9 has closed loop at top.
+5 vs 6: 5 has flat top. 6 has curved top closing into a loop.
+6 vs 8: 6 has ONE loop. 8 has TWO loops. Count the loops.
+In numeric fields never use letters: always 0 not O, 1 not l/I, 5 not S, 8 not B.
 """
 
 def get_db():
@@ -124,12 +110,11 @@ def update_items_db(csv_text):
 def build_reference_list(known_items):
     if not known_items:
         return ""
-    lines = ["KNOWN ITEM REFERENCE DATABASE (from previously processed invoices):"]
-    lines.append("If you see a product code that matches one below, use the known name and price as a reference.")
-    lines.append("If your reading differs from the reference, double-check your reading carefully.\n")
+    lines = ["KNOWN ITEM REFERENCE DATABASE:"]
+    lines.append("Use these as reference. If your reading differs, double-check carefully.\n")
     for code, item in list(known_items.items())[:50]:
         confidence = "HIGH" if item['count'] >= 5 else "MEDIUM" if item['count'] >= 2 else "LOW"
-        lines.append(f"  {code} | {item['name']} | ${item['price']:.2f} | {item['uom']} | Confidence: {confidence} (seen {item['count']}x)")
+        lines.append(f"  {code} | {item['name']} | ${item['price']:.2f} | {item['uom']} | {confidence} (seen {item['count']}x)")
     return '\n'.join(lines)
 
 def img_to_b64(img, quality=90):
@@ -137,36 +122,65 @@ def img_to_b64(img, quality=90):
     img.save(buf, format='JPEG', quality=quality)
     return base64.standard_b64encode(buf.getvalue()).decode('utf-8')
 
-def pdf_to_images_with_crops(pdf_bytes):
+def prepare_images(pdf_bytes):
     Image.MAX_IMAGE_PIXELS = None
-    images = convert_from_bytes(pdf_bytes, dpi=150)
+    images = convert_from_bytes(pdf_bytes, dpi=200)
     num_pages = len(images)
-    result = []
+    result = {'pages': [], 'crops': {}}
 
     for page_num, img in enumerate(images):
         w, h = img.size
 
         if num_pages > 1:
-            # Multi-page invoice: resize and send full page only, no crops
-            max_dimension = 1800
-            if img.width > max_dimension or img.height > max_dimension:
-                img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
-            result.append({'type': 'full', 'page': page_num + 1, 'b64': img_to_b64(img, quality=80)})
+            thumb = img.copy()
+            thumb.thumbnail((1600, 1600), Image.LANCZOS)
+            result['pages'].append(img_to_b64(thumb, quality=75))
         else:
-            # Single page receipt: full res + high-res crops
-            result.append({'type': 'full', 'page': page_num + 1, 'b64': img_to_b64(img, quality=90)})
+            result['pages'].append(img_to_b64(img, quality=90))
 
-            # Product code crop (left 20%, skip top 10%)
-            code_crop = img.crop((0, int(h * 0.10), int(w * 0.20), int(h * 0.95)))
-            code_crop = code_crop.resize((code_crop.width * 2, code_crop.height * 2), Image.LANCZOS)
-            result.append({'type': 'codes', 'page': page_num + 1, 'b64': img_to_b64(code_crop, quality=95)})
+        # Only crop on single page or first page
+        if page_num == 0:
+            top = int(h * 0.10)
+            bottom = int(h * 0.95)
 
-            # Numbers crop (right 40%)
-            numbers_crop = img.crop((int(w * 0.60), int(h * 0.10), w, int(h * 0.95)))
-            numbers_crop = numbers_crop.resize((numbers_crop.width * 2, numbers_crop.height * 2), Image.LANCZOS)
-            result.append({'type': 'numbers', 'page': page_num + 1, 'b64': img_to_b64(numbers_crop, quality=95)})
+            # Product codes column (left ~15%)
+            codes = img.crop((0, top, int(w * 0.15), bottom))
+            codes = codes.resize((codes.width * 3, codes.height * 3), Image.LANCZOS)
+            result['crops']['codes'] = img_to_b64(codes, quality=97)
+
+            # Product names column (15-55%)
+            names = img.crop((int(w * 0.15), top, int(w * 0.55), bottom))
+            names = names.resize((names.width * 2, names.height * 2), Image.LANCZOS)
+            result['crops']['names'] = img_to_b64(names, quality=90)
+
+            # Qty column (~55-65%)
+            qty = img.crop((int(w * 0.55), top, int(w * 0.65), bottom))
+            qty = qty.resize((qty.width * 4, qty.height * 4), Image.LANCZOS)
+            result['crops']['qty'] = img_to_b64(qty, quality=97)
+
+            # Unit price column (~65-80%)
+            price = img.crop((int(w * 0.65), top, int(w * 0.80), bottom))
+            price = price.resize((price.width * 4, price.height * 4), Image.LANCZOS)
+            result['crops']['price'] = img_to_b64(price, quality=97)
+
+            # Total column (~80-100%)
+            total = img.crop((int(w * 0.80), top, w, bottom))
+            total = total.resize((total.width * 4, total.height * 4), Image.LANCZOS)
+            result['crops']['total'] = img_to_b64(total, quality=97)
 
     return result
+
+def claude_call(client, images, prompt):
+    content = []
+    for img in images:
+        content.append({"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": img}})
+    content.append({"type": "text", "text": prompt})
+    msg = client.messages.create(
+        model="claude-sonnet-4-6",
+        max_tokens=2048,
+        messages=[{"role": "user", "content": content}]
+    )
+    return msg.content[0].text.strip()
 
 def could_be_misread(read_value, calculated_value):
     read_str = f"{read_value:.2f}"
@@ -227,11 +241,11 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
             claude_read_total = float(invoice_total)
             diff = abs(round(running_total, 2) - claude_read_total)
             if diff < 0.10:
-                flagged.append(f"GRAND TOTAL VERIFIED: line items sum to ${running_total:.2f}")
+                flagged.append(f"GRAND TOTAL VERIFIED: ${running_total:.2f}")
             elif could_be_misread(claude_read_total, running_total):
-                flagged.append(f"GRAND TOTAL OK: Claude read ${claude_read_total:.2f} from image but line items sum to ${running_total:.2f} — difference of ${diff:.2f} is consistent with a common misread. Trusting the math.")
+                flagged.append(f"GRAND TOTAL OK: Claude read ${claude_read_total:.2f}, calculated ${running_total:.2f} — consistent with common misread. Trusting math.")
             else:
-                flagged.append(f"GRAND TOTAL MISMATCH: Claude read ${claude_read_total:.2f} from image but line items sum to ${running_total:.2f} — difference of ${diff:.2f} cannot be explained by a misread. Manual review required.")
+                flagged.append(f"GRAND TOTAL MISMATCH: Claude read ${claude_read_total:.2f}, calculated ${running_total:.2f} — difference ${abs(running_total - claude_read_total):.2f}. Manual review required.")
         except ValueError:
             pass
     else:
@@ -269,141 +283,141 @@ def process_invoice():
     known_items = get_known_items()
     reference_list = build_reference_list(known_items)
 
+    client = anthropic.Anthropic(api_key=api_key)
+
     is_pdf = 'pdf' in content_type or file_url.lower().endswith('.pdf')
-    content_blocks = []
 
     if is_pdf:
         try:
-            page_images = pdf_to_images_with_crops(file_bytes)
-            num_pages = max(item['page'] for item in page_images)
+            imgs = prepare_images(file_bytes)
+            pages = imgs['pages']
+            crops = imgs['crops']
 
-            # Always send full pages first
-            for item in page_images:
-                if item['type'] == 'full':
-                    content_blocks.append({
-                        "type": "image",
-                        "source": {"type": "base64", "media_type": "image/jpeg", "data": item['b64']}
-                    })
-
-            # For single page receipts, also send crops
-            if num_pages == 1:
-                content_blocks.append({
-                    "type": "text",
-                    "text": "The following is a high-resolution crop of the PRODUCT CODE column — use this to read product codes accurately:"
-                })
-                for item in page_images:
-                    if item['type'] == 'codes':
-                        content_blocks.append({
-                            "type": "image",
-                            "source": {"type": "base64", "media_type": "image/jpeg", "data": item['b64']}
-                        })
-
-                content_blocks.append({
-                    "type": "text",
-                    "text": "The following is a high-resolution crop of the QTY, UNIT PRICE, and TOTAL columns — use this to read numbers accurately:"
-                })
-                for item in page_images:
-                    if item['type'] == 'numbers':
-                        content_blocks.append({
-                            "type": "image",
-                            "source": {"type": "base64", "media_type": "image/jpeg", "data": item['b64']}
-                        })
-
-        except Exception as e:
-            print(f"Image conversion failed, falling back to PDF beta: {e}")
-            file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
-            content_blocks = [{
-                "type": "document",
-                "source": {"type": "base64", "media_type": "application/pdf", "data": file_base64}
-            }]
-    else:
-        file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
-        content_blocks = [{
-            "type": "image",
-            "source": {"type": "base64", "media_type": content_type or "image/jpeg", "data": file_base64}
-        }]
-
-    content_blocks.append({
-        "type": "text",
-        "text": f"""This document is a photo or scan of a printed invoice or receipt from Virginia ABC. Image quality may vary — it could be a multi-page order invoice or a single-page thermal printer receipt. Handle both formats.
-
+            # CALL 1: Get product codes from high-res crop
+            codes_text = claude_call(client, [crops['codes']], f"""This is a high-resolution crop of the PRODUCT CODE column from a Virginia ABC invoice.
 {DIGIT_AMBIGUITY_GUIDE}
+{reference_list}
+Read every product code from top to bottom. Return only a numbered list like:
+1. 011297
+2. 015626
+...
+No explanation. Numbers only.""")
+
+            # CALL 2: Get product names from full page
+            names_text = claude_call(client, pages, f"""This is a Virginia ABC invoice.
+Read every product name from top to bottom in the same order as the product codes.
+Return only a numbered list like:
+1. crown royal whisky
+2. jameson irish whiskey
+...
+No explanation. Names in lowercase only.""")
+
+            # CALL 3: Get quantities from high-res crop
+            qty_text = claude_call(client, [crops['qty']], f"""This is a high-resolution crop of the ORDER QTY column from a Virginia ABC invoice.
+{DIGIT_AMBIGUITY_GUIDE}
+Quantities are often 2 digits: 10, 14, 24 are common. Read carefully.
+Return only a numbered list like:
+1. 2
+2. 1
+...
+No explanation. Numbers only.""")
+
+            # CALL 4: Get unit prices and totals from high-res crops
+            prices_text = claude_call(client, [crops['price'], crops['total']], f"""These are high-resolution crops of the UNIT PRICE column and TOTAL AMOUNT column from a Virginia ABC invoice.
+{DIGIT_AMBIGUITY_GUIDE}
+Return two numbered lists:
+UNIT PRICES:
+1. 38.99
+2. 27.99
+...
+TOTALS:
+1. 77.98
+2. 27.99
+...
+Also include the grand total at the end like: GRAND_TOTAL:5763.74
+No explanation. Numbers only.""")
+
+            # CALL 5: Merge everything into CSV
+            merge_prompt = f"""You are merging data from a Virginia ABC invoice that was read in separate passes.
+Here is the data from each pass:
+
+PRODUCT CODES:
+{codes_text}
+
+PRODUCT NAMES:
+{names_text}
+
+QUANTITIES:
+{qty_text}
+
+UNIT PRICES AND TOTALS:
+{prices_text}
 
 {reference_list}
 
-When reading any number, consult the ambiguity guide above. If a digit looks unusual, use the guide to resolve it. If a product code matches one in the reference database, use that as a strong hint. Always verify using math: Qty × Unit Price = Total.
+Instructions:
+- Match row 1 code with row 1 name with row 1 qty with row 1 price with row 1 total, etc.
+- For every row verify: Qty × Unit Price = Total. If they don't match, use Total ÷ Unit Price to correct Qty.
+- Find the document number and date from the data if mentioned, otherwise use today: {upload_date}
 
-YOU MUST FOLLOW THESE STEPS IN ORDER. DO NOT SKIP ANY STEP.
-
-STEP 1 — READ PRODUCT CODES:
-Use the high-resolution product code crop if provided, otherwise use the full page. Read every code top to bottom. Use the digit ambiguity guide. Cross-reference with the known items database.
-
-STEP 2 — READ PRODUCT NAMES:
-Use the full page image. Read every product name top to bottom.
-
-STEP 3 — READ ORDER QTY:
-Use the high-resolution numbers crop if provided, otherwise use the full page. Read every quantity top to bottom. These are often 2-digit numbers like 14, 24, 10.
-
-STEP 4 — READ UNIT PRICE:
-Use the high-resolution numbers crop if provided. Read every unit price top to bottom. Cross-reference with the known items database — if a price differs significantly from the known price, re-read it carefully.
-
-STEP 5 — READ TOTAL AMOUNT:
-Use the high-resolution numbers crop if provided. Read every total top to bottom.
-
-STEP 6 — READ DATE AND GRAND TOTAL:
-Find the date and grand total. If no date is present on the document, use today's date: {upload_date}.
-
-STEP 7 — COMBINE INTO ROWS:
-Match each product code with its name, qty, unit price, and total by position.
-For every row verify: Qty × Unit Price = Total.
-If they don't match, use the digit ambiguity guide to re-read ambiguous digits.
-Use Total ÷ Unit Price to calculate correct Qty if needed.
-
-STEP 8 — VERIFY GRAND TOTAL:
-Sum all Total values. Confirm they match the grand total.
-If they don't match, use the digit ambiguity guide to find and fix the misread digit.
-
-STEP 9 — OUTPUT CSV:
-Return the data as a CSV with exactly these columns:
-
+Return as CSV with these exact columns:
 Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location
 
 Column rules:
 - Vendor: always VA ABC
 - Location: always {location_code}
-- Document Number: order number or receipt number from the document
-- Date: date from the document in M/D/YYYY format, or {upload_date} if no date found
-- Vendor Item Number: product code or GTIN number
+- Document Number: order/receipt number
+- Date: M/D/YYYY format or {upload_date}
+- Vendor Item Number: product code
 - Vendor Item Name: product name in lowercase
 - UofM: Bottle for 750ml, Liter for 1L, Each for anything else
-- Qty: formatted as X.00
+- Qty: X.00 format
 - Unit Price: no $ sign
 - Total: no $ sign
 - Image URL: {file_url}
 - Break Flag: always N
 - Detail Location: always {location_code}
 
-After the last CSV row add this line:
-GRAND_TOTAL:[the grand total number only, no $ sign]
+After last row add: GRAND_TOTAL:[number only]
+Return only CSV rows and GRAND_TOTAL. No explanation. No markdown."""
 
-Return only the CSV rows and the GRAND_TOTAL line. No explanation. No markdown. No column lists from the intermediate steps."""
-    })
+            final_text = claude_call(client, [], merge_prompt) if False else client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=4096,
+                messages=[{"role": "user", "content": [{"type": "text", "text": merge_prompt}]}]
+            ).content[0].text.strip()
 
-    client = anthropic.Anthropic(api_key=api_key)
-    message = client.messages.create(
-        model="claude-sonnet-4-6",
-        max_tokens=4096,
-        messages=[{
-            "role": "user",
-            "content": content_blocks
-        }]
-    )
-
-    raw_output = message.content[0].text
+        except Exception as e:
+            print(f"Multi-call failed: {e}, falling back to PDF beta")
+            file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+            final_text = client.beta.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=4096,
+                betas=["pdfs-2024-09-25"],
+                messages=[{"role": "user", "content": [
+                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": file_base64}},
+                    {"type": "text", "text": f"Extract all line items as CSV: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location. Vendor=VA ABC, Location={location_code}, Image URL={file_url}, Break Flag=N, Detail Location={location_code}. Add GRAND_TOTAL at end."}
+                ]}
+            ).content[0].text.strip()
+    else:
+        file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+        final_text = client.messages.create(
+            model="claude-sonnet-4-6",
+            max_tokens=4096,
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {"type": "base64", "media_type": content_type or "image/jpeg", "data": file_base64}},
+                {"type": "text", "text": f"""Extract all line items from this Virginia ABC receipt as CSV.
+{DIGIT_AMBIGUITY_GUIDE}
+{reference_list}
+Columns: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location
+Rules: Vendor=VA ABC, Location={location_code}, Date={upload_date} if not found, Image URL={file_url}, Break Flag=N, Detail Location={location_code}
+Add GRAND_TOTAL:[number] at end. No header. No explanation."""}
+            ]}
+        ).content[0].text.strip()
 
     invoice_total = None
     csv_lines = []
-    for line in raw_output.strip().split('\n'):
+    for line in final_text.strip().split('\n'):
         if line.startswith('GRAND_TOTAL:'):
             invoice_total = line.replace('GRAND_TOTAL:', '').strip()
         else:
