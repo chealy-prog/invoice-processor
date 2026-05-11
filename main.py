@@ -17,6 +17,9 @@ FTP_USER = 'housepitality'
 FTP_PASS = 'H@usePR365!'
 FTP_DIR = '/housepitality/APImports/R365'
 DATABASE_URL = 'postgresql://postgres:GkGZfSbGRykvjAPVNVxtCEZFldAFuwUa@postgres.railway.internal:5432/railway'
+R365_URL = 'https://housepitality.restaurant365.com'
+R365_USER = 'housepitalityAPI'
+R365_PASS = 'pu5VJcpESkLA4Y'
  
 COMMON_MISREADS = {
     '0': ['8', 'O', 'D'],
@@ -231,6 +234,70 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
  
     return '\n'.join(fixed_lines), flagged, round(running_total, 2)
  
+def get_r365_token():
+    resp = httpx.post(
+        f"{R365_URL}/APIv1/Authenticate/JWT",
+        params={"format": "json"},
+        json={"UserName": R365_USER, "Password": R365_PASS},
+        headers={"Content-Type": "application/json"},
+        timeout=30
+    )
+    resp.raise_for_status()
+    return resp.json()["BearerToken"]
+ 
+def push_to_r365(csv_text, location_code, file_url):
+    token = get_r365_token()
+    lines = csv_text.strip().split('\n')
+    invoice_lines = []
+    doc_number = None
+    invoice_date = None
+ 
+    for line in lines:
+        if not line.strip() or line.startswith('Vendor,'):
+            continue
+        cols = line.split(',')
+        if len(cols) < 13:
+            continue
+        if not doc_number:
+            doc_number = cols[2].strip()
+            invoice_date = cols[3].strip()
+        try:
+            invoice_lines.append({
+                "Vendor_Name": "VA ABC",
+                "Retailer_Store_Number": str(location_code),
+                "Invoice_Date": invoice_date,
+                "Invoice_Number": doc_number,
+                "Invoice_Amount": float(cols[9].strip()),
+                "Image_URL": file_url,
+                "Product_Number": cols[4].strip(),
+                "Quantity": float(cols[7].strip()),
+                "Invoice_Line_Item_Cost": float(cols[8].strip()),
+                "Extended_Price": float(cols[9].strip()),
+                "Product_Description": cols[5].strip(),
+                "Unit_Of_Measure": cols[6].strip()
+            })
+        except (ValueError, IndexError) as e:
+            print(f"Skipping line: {e}")
+            continue
+ 
+    payload = {
+        "BatchId": doc_number or "VABC_IMPORT",
+        "userId": R365_USER,
+        "apInvoices": invoice_lines
+    }
+ 
+    resp = httpx.post(
+        f"{R365_URL}/APIv1/APInvoices",
+        json=payload,
+        headers={
+            "Authorization": token,
+            "Content-Type": "application/json"
+        },
+        timeout=60
+    )
+    resp.raise_for_status()
+    return resp.json()
+ 
 def upload_to_ftp(filename, content):
     ftp = ftplib.FTP()
     ftp.connect(FTP_HOST, 21)
@@ -271,20 +338,18 @@ def process_invoice():
             page_b64s = [p[0] for p in pages]
  
             # CALL 1: Detect column boundaries
-            detect_prompt = """This is a Virginia ABC invoice or receipt image.
-I need to crop specific columns for high-resolution reading.
-The image dimensions are: """ + str(raw_images[0].size[0]) + "x" + str(raw_images[0].size[1]) + """ pixels.
+            detect_prompt = "This is a Virginia ABC invoice or receipt image.\n"
+            detect_prompt += "Image dimensions: " + str(raw_images[0].size[0]) + "x" + str(raw_images[0].size[1]) + " pixels.\n"
+            detect_prompt += """Identify the pixel boundaries of these columns on the first page:
+- product_code: column with 6-digit item/product codes
+- product_name: column with product names
+- qty: column with order quantities
+- unit_price: column with unit prices
+- total: column with total amounts
+- data_top: y pixel where data rows start (after header)
+- data_bottom: y pixel where data rows end (before footer)
  
-Please identify the pixel boundaries of these columns in the FIRST page:
-- product_code: the column containing item/product codes (6-digit numbers)
-- product_name: the column containing product names
-- qty: the column containing order quantities
-- unit_price: the column containing unit prices
-- total: the column containing total amounts
-- data_top: the y pixel where data rows start (after header)
-- data_bottom: the y pixel where data rows end (before footer/totals)
- 
-Return ONLY a JSON object like this:
+Return ONLY valid JSON like:
 {
   "product_code": {"x1": 50, "x2": 150},
   "product_name": {"x1": 155, "x2": 400},
@@ -294,26 +359,24 @@ Return ONLY a JSON object like this:
   "data_top": 120,
   "data_bottom": 900
 }
- 
-Return only the JSON. No explanation."""
+No explanation. JSON only."""
  
             bounds_text = claude_call(client, [page_b64s[0]], detect_prompt, max_tokens=500)
  
-            # Parse bounds
             try:
-                # Strip any markdown
                 bounds_text = bounds_text.replace('```json', '').replace('```', '').strip()
                 bounds = json.loads(bounds_text)
             except Exception as e:
                 print(f"Bounds parse error: {e}, using fallback")
+                w_img, h_img = raw_images[0].size
                 bounds = {
-                    "product_code": {"x1": 0, "x2": 150},
-                    "product_name": {"x1": 150, "x2": 500},
-                    "qty": {"x1": 500, "x2": 580},
-                    "unit_price": {"x1": 580, "x2": 700},
-                    "total": {"x1": 700, "x2": 850},
-                    "data_top": 100,
-                    "data_bottom": int(raw_images[0].size[1] * 0.92)
+                    "product_code": {"x1": 0, "x2": int(w_img * 0.15)},
+                    "product_name": {"x1": int(w_img * 0.15), "x2": int(w_img * 0.55)},
+                    "qty": {"x1": int(w_img * 0.55), "x2": int(w_img * 0.65)},
+                    "unit_price": {"x1": int(w_img * 0.65), "x2": int(w_img * 0.80)},
+                    "total": {"x1": int(w_img * 0.80), "x2": w_img},
+                    "data_top": int(h_img * 0.10),
+                    "data_bottom": int(h_img * 0.95)
                 }
  
             img = raw_images[0]
@@ -330,7 +393,6 @@ Return only the JSON. No explanation."""
                 return img_to_b64(crop, quality=97)
  
             codes_b64 = make_crop('product_code', scale=4)
-            names_b64 = make_crop('product_name', scale=2)
             qty_b64 = make_crop('qty', scale=4)
             price_b64 = make_crop('unit_price', scale=4)
             total_b64 = make_crop('total', scale=4)
@@ -339,62 +401,28 @@ Return only the JSON. No explanation."""
             codes_text = claude_call(
                 client,
                 [codes_b64],
-                DIGIT_AMBIGUITY_GUIDE + "\n" + reference_list + """
- 
-This is a high-resolution crop of ONLY the product code column from a Virginia ABC invoice.
-Read every product code from top to bottom.
-Return only a numbered list:
-1. 011297
-2. 015626
-No explanation. No extra text."""
+                DIGIT_AMBIGUITY_GUIDE + "\n" + reference_list + "\n\nThis is a high-resolution crop of ONLY the product code column from a Virginia ABC invoice.\nRead every product code top to bottom.\nReturn only a numbered list:\n1. 011297\n2. 015626\nNo explanation. Numbers only."
             )
  
-            # CALL 3: Product names + doc info
+            # CALL 3: Names + doc info from full page
             names_text = claude_call(
                 client,
-                [page_b64s[0]],
-                """This is a Virginia ABC invoice or receipt.
-Read every product name from top to bottom.
-Also find: document/order number, and date (if present).
-Return:
-DOCUMENT_NUMBER: [number]
-DATE: [date or NONE]
-NAMES:
-1. crown royal whisky
-2. jameson irish whiskey
-No explanation."""
+                page_b64s,
+                "This is a Virginia ABC invoice or receipt.\nRead every product name top to bottom.\nAlso find the document/order number and date.\nReturn:\nDOCUMENT_NUMBER: [number]\nDATE: [date or NONE]\nNAMES:\n1. crown royal whisky\n2. jameson irish whiskey\nNo explanation."
             )
  
             # CALL 4: Quantities
             qty_text = claude_call(
                 client,
                 [qty_b64],
-                DIGIT_AMBIGUITY_GUIDE + """
- 
-This is a high-resolution crop of ONLY the order quantity column from a Virginia ABC invoice.
-Quantities are often multi-digit: 10, 14, 24 are common. Read every digit carefully.
-Return only a numbered list:
-1. 2
-2. 14
-No explanation. Numbers only."""
+                DIGIT_AMBIGUITY_GUIDE + "\n\nThis is a high-resolution crop of ONLY the order quantity column.\nQuantities are often multi-digit: 10, 14, 24 are common.\nReturn only a numbered list:\n1. 2\n2. 14\nNo explanation. Numbers only."
             )
  
             # CALL 5: Prices and totals
             prices_text = claude_call(
                 client,
                 [price_b64, total_b64],
-                DIGIT_AMBIGUITY_GUIDE + """
- 
-These are high-resolution crops of the UNIT PRICE column and TOTAL AMOUNT column from a Virginia ABC invoice.
-Return:
-UNIT PRICES:
-1. 38.99
-2. 31.99
-TOTALS:
-1. 77.98
-2. 447.86
-GRAND_TOTAL: 5763.74
-No explanation. Numbers only."""
+                DIGIT_AMBIGUITY_GUIDE + "\n\nThese are high-resolution crops of the UNIT PRICE and TOTAL AMOUNT columns.\nReturn:\nUNIT PRICES:\n1. 38.99\n2. 31.99\nTOTALS:\n1. 77.98\n2. 447.86\nGRAND_TOTAL: 5763.74\nNo explanation. Numbers only."
             )
  
             # Build merge prompt
@@ -404,29 +432,13 @@ No explanation. Numbers only."""
             merge_prompt += "QUANTITIES:\n" + qty_text + "\n\n"
             merge_prompt += "UNIT PRICES AND TOTALS:\n" + prices_text + "\n\n"
             merge_prompt += reference_list + "\n\n"
-            merge_prompt += "Instructions:\n"
-            merge_prompt += "- Match row 1 code with row 1 name with row 1 qty with row 1 price with row 1 total, etc.\n"
-            merge_prompt += "- For every row verify: Qty x Unit Price = Total. If they do not match, use Total divided by Unit Price to correct Qty.\n"
-            merge_prompt += "- Extract document number and date from NAMES AND DOCUMENT INFO above.\n"
-            merge_prompt += "- If date is NONE, use: " + upload_date + "\n\n"
-            merge_prompt += "Return as CSV with these exact columns:\n"
-            merge_prompt += "Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n\n"
-            merge_prompt += "Rules:\n"
-            merge_prompt += "- Vendor: always VA ABC\n"
-            merge_prompt += "- Location: always " + str(location_code) + "\n"
-            merge_prompt += "- Document Number: from invoice\n"
-            merge_prompt += "- Date: M/D/YYYY format\n"
-            merge_prompt += "- Vendor Item Number: product code\n"
-            merge_prompt += "- Vendor Item Name: product name in lowercase\n"
-            merge_prompt += "- UofM: Bottle for 750ml, Liter for 1L, Each for anything else\n"
-            merge_prompt += "- Qty: X.00 format\n"
-            merge_prompt += "- Unit Price: no $ sign\n"
-            merge_prompt += "- Total: no $ sign\n"
-            merge_prompt += "- Image URL: " + file_url + "\n"
-            merge_prompt += "- Break Flag: always N\n"
-            merge_prompt += "- Detail Location: always " + str(location_code) + "\n\n"
-            merge_prompt += "After last row add: GRAND_TOTAL:[number only]\n"
-            merge_prompt += "Return only CSV rows and GRAND_TOTAL line. No header. No explanation. No markdown."
+            merge_prompt += "Match row 1 code with row 1 name with row 1 qty with row 1 price with row 1 total, etc.\n"
+            merge_prompt += "For every row verify: Qty x Unit Price = Total. If not, use Total / Unit Price to correct Qty.\n"
+            merge_prompt += "Extract document number and date from NAMES AND DOCUMENT INFO. If date is NONE use: " + upload_date + "\n\n"
+            merge_prompt += "Return as CSV:\nVendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n\n"
+            merge_prompt += "Vendor=VA ABC, Location=" + str(location_code) + ", UofM=Bottle for 750ml/Liter for 1L/Each otherwise, "
+            merge_prompt += "Qty=X.00, no $ signs, Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + "\n\n"
+            merge_prompt += "After last row add: GRAND_TOTAL:[number only]\nNo header. No explanation. No markdown."
  
             final_text = claude_text_call(client, merge_prompt)
  
@@ -449,7 +461,7 @@ No explanation. Numbers only."""
         receipt_prompt = DIGIT_AMBIGUITY_GUIDE + "\n" + reference_list + "\n"
         receipt_prompt += "Extract all line items from this Virginia ABC receipt as CSV.\n"
         receipt_prompt += "Columns: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n"
-        receipt_prompt += "Rules: Vendor=VA ABC, Location=" + str(location_code) + ", Date=" + upload_date + " if not found, Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + "\n"
+        receipt_prompt += "Vendor=VA ABC, Location=" + str(location_code) + ", Date=" + upload_date + " if not found, Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + "\n"
         receipt_prompt += "Add GRAND_TOTAL:[number] at end. No header. No explanation. No markdown."
  
         msg = client.messages.create(
@@ -472,7 +484,6 @@ No explanation. Numbers only."""
  
     csv_text = '\n'.join(csv_lines)
     fixed_csv, flagged, calculated_total = validate_and_fix_csv(csv_text, invoice_total)
- 
     update_items_db(fixed_csv)
  
     try:
@@ -484,16 +495,29 @@ No explanation. Numbers only."""
     except Exception:
         filename = "Colin_Export_VABC_invoice.csv"
  
-    ftp_status = "success"
+    # Try R365 API first, fall back to FTP
+    r365_status = "not attempted"
+    ftp_status = "not attempted"
+ 
     try:
-        upload_to_ftp(filename, fixed_csv)
+        r365_response = push_to_r365(fixed_csv, location_code, file_url)
+        r365_status = "success"
+        flagged.append(f"R365 API: Invoice pushed successfully")
     except Exception as e:
-        ftp_status = f"FTP error: {str(e)}"
-        flagged.append(ftp_status)
+        r365_status = f"R365 API error: {str(e)}"
+        flagged.append(f"R365 API failed: {str(e)} — falling back to FTP")
+        try:
+            upload_to_ftp(filename, fixed_csv)
+            ftp_status = "success"
+            flagged.append("FTP fallback: success")
+        except Exception as ftp_e:
+            ftp_status = f"FTP error: {str(ftp_e)}"
+            flagged.append(f"FTP fallback failed: {str(ftp_e)}")
  
     return jsonify({
         "result": fixed_csv,
         "filename": filename,
+        "r365_status": r365_status,
         "ftp_status": ftp_status,
         "calculated_total": calculated_total,
         "claude_read_total": invoice_total,
@@ -503,5 +527,4 @@ No explanation. Numbers only."""
  
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
- 
  
