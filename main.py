@@ -51,16 +51,16 @@ def img_to_b64(img, quality=90):
 
 def prepare_pages(pdf_bytes):
     Image.MAX_IMAGE_PIXELS = None
-    images = convert_from_bytes(pdf_bytes, dpi=200)
+    images = convert_from_bytes(pdf_bytes, dpi=150)
     num_pages = len(images)
     page_b64s = []
     for img in images:
-        if num_pages > 1:
-            thumb = img.copy()
-            thumb.thumbnail((1600, 1600), Image.LANCZOS)
-            page_b64s.append(img_to_b64(thumb, quality=75))
-        else:
-            page_b64s.append(img_to_b64(img, quality=90))
+        # Always resize to fit within Claude 5MB limit
+        max_dimension = 1800 if num_pages == 1 else 1400
+        if img.width > max_dimension or img.height > max_dimension:
+            img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
+        quality = 85 if num_pages == 1 else 70
+        page_b64s.append(img_to_b64(img, quality=quality))
     return page_b64s
 
 def claude_call(api_key, images, prompt, max_tokens=2048):
