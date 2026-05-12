@@ -173,7 +173,7 @@ def get_r365_token():
 def push_to_r365(csv_text, location_code, file_url):
     token = get_r365_token()
     lines = csv_text.strip().split('\n')
-    ap_invoices = []
+    invoice_lines = []
     doc_number = None
     invoice_date = None
 
@@ -187,18 +187,11 @@ def push_to_r365(csv_text, location_code, file_url):
             doc_number = cols[2].strip()
             invoice_date = cols[3].strip()
         try:
-            extended_price = float(cols[9].strip())
-            ap_invoices.append({
-                "Vendor_Name": "VA ABC",
-                "Retailer_Store_Number": str(location_code),
-                "Invoice_Date": invoice_date,
-                "Invoice_Number": doc_number,
-                "Invoice_Amount": extended_price,
-                "Image_URL": file_url,
+            invoice_lines.append({
                 "Product_Number": cols[4].strip(),
                 "Quantity": float(cols[7].strip()),
                 "Invoice_Line_Item_Cost": float(cols[8].strip()),
-                "Extended_Price": extended_price,
+                "Extended_Price": float(cols[9].strip()),
                 "Product_Description": cols[5].strip(),
                 "Unit_Of_Measure": cols[6].strip()
             })
@@ -209,7 +202,15 @@ def push_to_r365(csv_text, location_code, file_url):
     payload = {
         "BatchId": doc_number or "VABC_IMPORT",
         "userId": R365_USER,
-        "apInvoices": ap_invoices
+        "apInvoices": [{
+            "Vendor_Name": "VA ABC",
+            "Retailer_Store_Number": str(location_code),
+            "Invoice_Date": invoice_date,
+            "Invoice_Number": doc_number,
+            "Invoice_Amount": sum(l["Extended_Price"] for l in invoice_lines),
+            "Image_URL": file_url,
+            "Invoice_Line_Items": invoice_lines
+        }]
     }
 
     resp = httpx.post(
