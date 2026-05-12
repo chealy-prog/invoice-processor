@@ -4,7 +4,6 @@ import httpx
 import ftplib
 import io
 import json
-import psycopg2
 from flask import Flask, request, jsonify
 from datetime import datetime
 from pdf2image import convert_from_bytes
