@@ -9,9 +9,9 @@ from flask import Flask, request, jsonify
 from datetime import datetime
 from pdf2image import convert_from_bytes
 from PIL import Image
- 
+
 app = Flask(__name__)
- 
+
 FTP_HOST = 'connect.restaurant365.net'
 FTP_USER = 'housepitality'
 FTP_PASS = 'H@usePR365!'
@@ -19,7 +19,7 @@ FTP_DIR = '/housepitality/APImports/R365'
 R365_URL = 'https://housepitality.restaurant365.com'
 R365_USER = 'housepitalityAPI'
 R365_PASS = 'pu5VJcpESkLA4Y'
- 
+
 COMMON_MISREADS = {
     '0': ['8', 'O', 'D'],
     '1': ['7', 'l', 'I', 'i'],
@@ -32,7 +32,7 @@ COMMON_MISREADS = {
     '8': ['0', '3', '6', 'B', 'S'],
     '9': ['4', 'q', 'g'],
 }
- 
+
 DIGIT_AMBIGUITY_GUIDE = """
 DIGIT AMBIGUITY REFERENCE LIST:
 0 vs 8: 0 is a clean oval. 8 has two loops. A gap in an oval = still 8.
@@ -43,12 +43,12 @@ DIGIT AMBIGUITY REFERENCE LIST:
 6 vs 8: 6 has ONE loop. 8 has TWO loops. Count the loops.
 In numeric fields never use letters: always 0 not O, 1 not l/I, 5 not S, 8 not B.
 """
- 
+
 def img_to_b64(img, quality=90):
     buf = io.BytesIO()
     img.save(buf, format='JPEG', quality=quality)
     return base64.standard_b64encode(buf.getvalue()).decode('utf-8')
- 
+
 def prepare_pages(pdf_bytes):
     Image.MAX_IMAGE_PIXELS = None
     images = convert_from_bytes(pdf_bytes, dpi=200)
@@ -62,7 +62,7 @@ def prepare_pages(pdf_bytes):
         else:
             pages.append((img_to_b64(img, quality=90), img.size))
     return images, pages
- 
+
 def claude_call(client, images, prompt, max_tokens=2048):
     content = []
     for img in images:
@@ -77,7 +77,7 @@ def claude_call(client, images, prompt, max_tokens=2048):
         messages=[{"role": "user", "content": content}]
     )
     return msg.content[0].text.strip()
- 
+
 def claude_text_call(client, prompt, max_tokens=4096):
     msg = client.messages.create(
         model="claude-sonnet-4-6",
@@ -85,7 +85,7 @@ def claude_text_call(client, prompt, max_tokens=4096):
         messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}]
     )
     return msg.content[0].text.strip()
- 
+
 def could_be_misread(read_value, calculated_value):
     read_str = f"{read_value:.2f}"
     calc_str = f"{calculated_value:.2f}"
@@ -103,14 +103,14 @@ def could_be_misread(read_value, calculated_value):
             continue
         return False
     return True
- 
+
 def validate_and_fix_csv(csv_text, invoice_total=None):
     lines = csv_text.strip().split('\n')
     fixed_lines = []
     flagged = []
     running_total = 0.0
     header = 'Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location'
- 
+
     for line in lines:
         if not line.strip():
             continue
@@ -122,14 +122,14 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
             flagged.append(f"SHORT ROW: {line}")
             fixed_lines.append(line)
             continue
- 
+
         try:
             qty = float(cols[7])
             unit_price = float(cols[8])
             total = float(cols[9])
             expected = round(qty * unit_price, 2)
             running_total += total
- 
+
             if abs(expected - total) > 0.02:
                 correct_qty = round(total / unit_price, 2)
                 flagged.append(f"MATH ERROR fixed: {cols[5]} qty {qty} -> {correct_qty} (expected {expected} got {total})")
@@ -137,9 +137,9 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
                 line = ','.join(cols)
         except (ValueError, ZeroDivisionError):
             flagged.append(f"PARSE ERROR: {line}")
- 
+
         fixed_lines.append(line)
- 
+
     if invoice_total:
         try:
             claude_read_total = float(invoice_total)
@@ -154,9 +154,9 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
             pass
     else:
         flagged.append(f"GRAND TOTAL (calculated): ${running_total:.2f}")
- 
+
     return '\n'.join(fixed_lines), flagged, round(running_total, 2)
- 
+
 def get_r365_token():
     resp = httpx.post(
         f"{R365_URL}/APIv1/Authenticate/JWT",
@@ -167,14 +167,14 @@ def get_r365_token():
     )
     resp.raise_for_status()
     return resp.json()["BearerToken"]
- 
+
 def push_to_r365(csv_text, location_code, file_url):
     token = get_r365_token()
     lines = csv_text.strip().split('\n')
     invoice_lines = []
     doc_number = None
     invoice_date = None
- 
+
     for line in lines:
         if not line.strip() or line.startswith('Vendor,'):
             continue
@@ -196,7 +196,7 @@ def push_to_r365(csv_text, location_code, file_url):
         except (ValueError, IndexError) as e:
             print(f"Skipping line: {e}")
             continue
- 
+
     # Single invoice with all line items grouped together
     payload = {
         "apInvoices": [{
@@ -209,7 +209,7 @@ def push_to_r365(csv_text, location_code, file_url):
             "Invoice_Line_Items": invoice_lines
         }]
     }
- 
+
     resp = httpx.post(
         f"{R365_URL}/APIv1/APInvoices",
         json=payload,
@@ -221,7 +221,7 @@ def push_to_r365(csv_text, location_code, file_url):
     )
     resp.raise_for_status()
     return resp.json()
- 
+
 def upload_to_ftp(filename, content):
     ftp = ftplib.FTP()
     ftp.connect(FTP_HOST, 21)
@@ -230,7 +230,7 @@ def upload_to_ftp(filename, content):
     ftp.cwd(FTP_DIR)
     ftp.storbinary(f'STOR {filename}', io.BytesIO(content.encode('utf-8')))
     ftp.quit()
- 
+
 @app.route('/process', methods=['POST'])
 def process_invoice():
     data = request.json
@@ -238,20 +238,20 @@ def process_invoice():
     api_key = data.get('api_key')
     location_code = data.get('location_code', '')
     upload_date = datetime.now().strftime('%-m/%-d/%Y')
- 
+
     file_response = httpx.get(file_url)
     file_bytes = file_response.content
     content_type = file_response.headers.get('content-type', '')
- 
+
     client = anthropic.Anthropic(api_key=api_key)
- 
+
     is_pdf = 'pdf' in content_type or file_url.lower().endswith('.pdf')
- 
+
     if is_pdf:
         try:
             raw_images, pages = prepare_pages(file_bytes)
             page_b64s = [p[0] for p in pages]
- 
+
             # CALL 1: Detect column boundaries
             detect_prompt = "This is a Virginia ABC invoice or receipt image.\n"
             detect_prompt += "Image dimensions: " + str(raw_images[0].size[0]) + "x" + str(raw_images[0].size[1]) + " pixels.\n"
@@ -263,7 +263,7 @@ def process_invoice():
 - total: column with total amounts
 - data_top: y pixel where data rows start (after header)
 - data_bottom: y pixel where data rows end (before footer/totals row)
- 
+
 Return ONLY valid JSON:
 {
   "product_code": {"x1": 50, "x2": 150},
@@ -275,9 +275,9 @@ Return ONLY valid JSON:
   "data_bottom": 900
 }
 No explanation. JSON only."""
- 
+
             bounds_text = claude_call(client, [page_b64s[0]], detect_prompt, max_tokens=500)
- 
+
             try:
                 bounds_text = bounds_text.replace('```json', '').replace('```', '').strip()
                 bounds = json.loads(bounds_text)
@@ -293,12 +293,12 @@ No explanation. JSON only."""
                     "data_top": int(h_img * 0.10),
                     "data_bottom": int(h_img * 0.95)
                 }
- 
+
             img = raw_images[0]
             w, h = img.size
             top = max(0, bounds.get('data_top', int(h * 0.10)))
             bottom = min(h, bounds.get('data_bottom', int(h * 0.95)))
- 
+
             def make_crop(col_key, scale=3):
                 col = bounds.get(col_key, {})
                 x1 = max(0, col.get('x1', 0))
@@ -306,18 +306,18 @@ No explanation. JSON only."""
                 crop = img.crop((x1, top, x2, bottom))
                 crop = crop.resize((crop.width * scale, crop.height * scale), Image.LANCZOS)
                 return img_to_b64(crop, quality=97)
- 
+
             codes_b64 = make_crop('product_code', scale=4)
             qty_b64 = make_crop('qty', scale=4)
             price_b64 = make_crop('unit_price', scale=4)
             total_b64 = make_crop('total', scale=4)
- 
+
             # CALL 2: Product codes
             codes_text = claude_call(
                 client,
                 [codes_b64],
                 DIGIT_AMBIGUITY_GUIDE + """
- 
+
 This is a high-resolution crop of ONLY the product code column from a Virginia ABC invoice.
 Read every product code from top to bottom. There may be items on multiple pages.
 Return only a numbered list:
@@ -325,7 +325,7 @@ Return only a numbered list:
 2. 015626
 No explanation. Numbers only."""
             )
- 
+
             # CALL 3: Names + doc info
             names_text = claude_call(
                 client,
@@ -341,13 +341,13 @@ NAMES:
 2. jameson irish whiskey
 No explanation."""
             )
- 
+
             # CALL 4: Quantities
             qty_text = claude_call(
                 client,
                 [qty_b64],
                 DIGIT_AMBIGUITY_GUIDE + """
- 
+
 This is a high-resolution crop of ONLY the order quantity column.
 Read every quantity from top to bottom. Include ALL rows.
 Quantities are often multi-digit: 10, 14, 24 are common.
@@ -356,13 +356,13 @@ Return only a numbered list:
 2. 14
 No explanation. Numbers only."""
             )
- 
+
             # CALL 5: Prices and totals
             prices_text = claude_call(
                 client,
                 [price_b64, total_b64],
                 DIGIT_AMBIGUITY_GUIDE + """
- 
+
 These are high-resolution crops of the UNIT PRICE and TOTAL AMOUNT columns.
 Read every value from top to bottom. Include ALL rows.
 Return:
@@ -375,7 +375,7 @@ TOTALS:
 GRAND_TOTAL: 5763.74
 No explanation. Numbers only."""
             )
- 
+
             # Merge prompt
             merge_prompt = "You are merging data from a Virginia ABC invoice read in separate passes.\n\n"
             merge_prompt += "PRODUCT CODES:\n" + codes_text + "\n\n"
@@ -392,9 +392,9 @@ No explanation. Numbers only."""
             merge_prompt += "Qty=X.00, no $ signs, Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + "\n\n"
             merge_prompt += "After last row add: GRAND_TOTAL:[number only]\n"
             merge_prompt += "No header row. No explanation. No markdown."
- 
+
             final_text = claude_text_call(client, merge_prompt)
- 
+
         except Exception as e:
             print(f"Multi-call failed: {e}, falling back to PDF beta")
             file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
@@ -408,7 +408,7 @@ No explanation. Numbers only."""
                 ]}]
             )
             final_text = msg.content[0].text.strip()
- 
+
     else:
         file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
         receipt_prompt = DIGIT_AMBIGUITY_GUIDE + "\n"
@@ -416,7 +416,7 @@ No explanation. Numbers only."""
         receipt_prompt += "Columns: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n"
         receipt_prompt += "Vendor=VA ABC, Location=" + str(location_code) + ", Date=" + upload_date + " if not found, Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + "\n"
         receipt_prompt += "Add GRAND_TOTAL:[number] at end. No header. No explanation. No markdown."
- 
+
         msg = client.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
@@ -426,7 +426,7 @@ No explanation. Numbers only."""
             ]}]
         )
         final_text = msg.content[0].text.strip()
- 
+
     invoice_total = None
     csv_lines = []
     for line in final_text.strip().split('\n'):
@@ -434,10 +434,10 @@ No explanation. Numbers only."""
             invoice_total = line.replace('GRAND_TOTAL:', '').strip()
         else:
             csv_lines.append(line)
- 
+
     csv_text = '\n'.join(csv_lines)
     fixed_csv, flagged, calculated_total = validate_and_fix_csv(csv_text, invoice_total)
- 
+
     try:
         first_data_line = [l for l in fixed_csv.split('\n') if l and not l.startswith('Vendor,')][0]
         cols = first_data_line.split(',')
@@ -446,11 +446,11 @@ No explanation. Numbers only."""
         filename = f"Colin_Export_VABC_{doc_number}_{date}.csv"
     except Exception:
         filename = "Colin_Export_VABC_invoice.csv"
- 
+
     # Try R365 API first, fall back to FTP
     r365_status = "not attempted"
     ftp_status = "not attempted"
- 
+
     try:
         r365_response = push_to_r365(fixed_csv, location_code, file_url)
         r365_status = "success"
@@ -465,7 +465,7 @@ No explanation. Numbers only."""
         except Exception as ftp_e:
             ftp_status = f"FTP error: {str(ftp_e)}"
             flagged.append(f"FTP fallback failed: {str(ftp_e)}")
- 
+
     return jsonify({
         "result": fixed_csv,
         "filename": filename,
@@ -475,8 +475,7 @@ No explanation. Numbers only."""
         "claude_read_total": invoice_total,
         "flagged": flagged
     })
- 
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
-
  
