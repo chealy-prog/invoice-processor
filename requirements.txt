@@ -3,3 +3,6 @@ flask
 httpx
 pdf2image
 pillow
+opencv-python-headless
+pytesseract
+numpy
