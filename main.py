@@ -16,7 +16,6 @@ FTP_HOST = 'connect.restaurant365.net'
 FTP_USER = 'housepitality'
 FTP_PASS = 'H@usePR365!'
 FTP_DIR = '/housepitality/APImports/R365'
-DATABASE_URL = 'postgresql://postgres:GkGZfSbGRykvjAPVNVxtCEZFldAFuwUa@postgres.railway.internal:5432/railway'
 R365_URL = 'https://housepitality.restaurant365.com'
 R365_USER = 'housepitalityAPI'
 R365_PASS = 'pu5VJcpESkLA4Y'
@@ -44,82 +43,6 @@ DIGIT AMBIGUITY REFERENCE LIST:
 6 vs 8: 6 has ONE loop. 8 has TWO loops. Count the loops.
 In numeric fields never use letters: always 0 not O, 1 not l/I, 5 not S, 8 not B.
 """
- 
-def get_db():
-    return psycopg2.connect(DATABASE_URL)
- 
-def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute('''
-        CREATE TABLE IF NOT EXISTS items (
-            product_code VARCHAR(20) PRIMARY KEY,
-            product_name VARCHAR(255),
-            unit_price DECIMAL(10,2),
-            uom VARCHAR(20),
-            seen_count INTEGER DEFAULT 1,
-            last_seen TIMESTAMP DEFAULT NOW()
-        )
-    ''')
-    conn.commit()
-    cur.close()
-    conn.close()
- 
-def get_known_items():
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        cur.execute('SELECT product_code, product_name, unit_price, uom, seen_count FROM items ORDER BY seen_count DESC')
-        rows = cur.fetchall()
-        cur.close()
-        conn.close()
-        return {row[0]: {'name': row[1], 'price': float(row[2]), 'uom': row[3], 'count': row[4]} for row in rows}
-    except Exception as e:
-        print(f"DB read error: {e}")
-        return {}
- 
-def update_items_db(csv_text):
-    try:
-        conn = get_db()
-        cur = conn.cursor()
-        for line in csv_text.strip().split('\n'):
-            if not line.strip() or line.startswith('Vendor,'):
-                continue
-            cols = line.split(',')
-            if len(cols) < 13:
-                continue
-            product_code = cols[4].strip()
-            product_name = cols[5].strip()
-            try:
-                unit_price = float(cols[8].strip())
-            except ValueError:
-                continue
-            uom = cols[6].strip()
-            cur.execute('''
-                INSERT INTO items (product_code, product_name, unit_price, uom, seen_count, last_seen)
-                VALUES (%s, %s, %s, %s, 1, NOW())
-                ON CONFLICT (product_code) DO UPDATE SET
-                    seen_count = items.seen_count + 1,
-                    last_seen = NOW(),
-                    product_name = EXCLUDED.product_name,
-                    unit_price = EXCLUDED.unit_price,
-                    uom = EXCLUDED.uom
-            ''', (product_code, product_name, unit_price, uom))
-        conn.commit()
-        cur.close()
-        conn.close()
-    except Exception as e:
-        print(f"DB write error: {e}")
- 
-def build_reference_list(known_items):
-    if not known_items:
-        return ""
-    lines = ["KNOWN ITEM REFERENCE DATABASE:"]
-    lines.append("Use these as reference. If your reading differs, double-check carefully.\n")
-    for code, item in list(known_items.items())[:50]:
-        confidence = "HIGH" if item['count'] >= 5 else "MEDIUM" if item['count'] >= 2 else "LOW"
-        lines.append(f"  {code} | {item['name']} | ${item['price']:.2f} | {item['uom']} | {confidence} (seen {item['count']}x)")
-    return '\n'.join(lines)
  
 def img_to_b64(img, quality=90):
     buf = io.BytesIO()
@@ -263,12 +186,6 @@ def push_to_r365(csv_text, location_code, file_url):
             invoice_date = cols[3].strip()
         try:
             invoice_lines.append({
-                "Vendor_Name": "VA ABC",
-                "Retailer_Store_Number": str(location_code),
-                "Invoice_Date": invoice_date,
-                "Invoice_Number": doc_number,
-                "Invoice_Amount": float(cols[9].strip()),
-                "Image_URL": file_url,
                 "Product_Number": cols[4].strip(),
                 "Quantity": float(cols[7].strip()),
                 "Invoice_Line_Item_Cost": float(cols[8].strip()),
@@ -280,10 +197,17 @@ def push_to_r365(csv_text, location_code, file_url):
             print(f"Skipping line: {e}")
             continue
  
+    # Single invoice with all line items grouped together
     payload = {
-        "BatchId": doc_number or "VABC_IMPORT",
-        "userId": R365_USER,
-        "apInvoices": invoice_lines
+        "apInvoices": [{
+            "Vendor_Name": "VA ABC",
+            "Retailer_Store_Number": str(location_code),
+            "Invoice_Date": invoice_date,
+            "Invoice_Number": doc_number,
+            "Invoice_Amount": sum(l["Extended_Price"] for l in invoice_lines),
+            "Image_URL": file_url,
+            "Invoice_Line_Items": invoice_lines
+        }]
     }
  
     resp = httpx.post(
@@ -307,12 +231,6 @@ def upload_to_ftp(filename, content):
     ftp.storbinary(f'STOR {filename}', io.BytesIO(content.encode('utf-8')))
     ftp.quit()
  
-with app.app_context():
-    try:
-        init_db()
-    except Exception as e:
-        print(f"DB init error: {e}")
- 
 @app.route('/process', methods=['POST'])
 def process_invoice():
     data = request.json
@@ -324,9 +242,6 @@ def process_invoice():
     file_response = httpx.get(file_url)
     file_bytes = file_response.content
     content_type = file_response.headers.get('content-type', '')
- 
-    known_items = get_known_items()
-    reference_list = build_reference_list(known_items)
  
     client = anthropic.Anthropic(api_key=api_key)
  
@@ -340,16 +255,16 @@ def process_invoice():
             # CALL 1: Detect column boundaries
             detect_prompt = "This is a Virginia ABC invoice or receipt image.\n"
             detect_prompt += "Image dimensions: " + str(raw_images[0].size[0]) + "x" + str(raw_images[0].size[1]) + " pixels.\n"
-            detect_prompt += """Identify the pixel boundaries of these columns on the first page:
+            detect_prompt += """Identify the exact pixel boundaries of these columns on the first page:
 - product_code: column with 6-digit item/product codes
 - product_name: column with product names
 - qty: column with order quantities
 - unit_price: column with unit prices
 - total: column with total amounts
 - data_top: y pixel where data rows start (after header)
-- data_bottom: y pixel where data rows end (before footer)
+- data_bottom: y pixel where data rows end (before footer/totals row)
  
-Return ONLY valid JSON like:
+Return ONLY valid JSON:
 {
   "product_code": {"x1": 50, "x2": 150},
   "product_name": {"x1": 155, "x2": 400},
@@ -401,44 +316,82 @@ No explanation. JSON only."""
             codes_text = claude_call(
                 client,
                 [codes_b64],
-                DIGIT_AMBIGUITY_GUIDE + "\n" + reference_list + "\n\nThis is a high-resolution crop of ONLY the product code column from a Virginia ABC invoice.\nRead every product code top to bottom.\nReturn only a numbered list:\n1. 011297\n2. 015626\nNo explanation. Numbers only."
+                DIGIT_AMBIGUITY_GUIDE + """
+ 
+This is a high-resolution crop of ONLY the product code column from a Virginia ABC invoice.
+Read every product code from top to bottom. There may be items on multiple pages.
+Return only a numbered list:
+1. 011297
+2. 015626
+No explanation. Numbers only."""
             )
  
-            # CALL 3: Names + doc info from full page
+            # CALL 3: Names + doc info
             names_text = claude_call(
                 client,
                 page_b64s,
-                "This is a Virginia ABC invoice or receipt.\nRead every product name top to bottom.\nAlso find the document/order number and date.\nReturn:\nDOCUMENT_NUMBER: [number]\nDATE: [date or NONE]\nNAMES:\n1. crown royal whisky\n2. jameson irish whiskey\nNo explanation."
+                """This is a Virginia ABC invoice or receipt.
+Read every product name from top to bottom. Include ALL items on ALL pages.
+Also find the document/order number and date.
+Return:
+DOCUMENT_NUMBER: [number]
+DATE: [date or NONE]
+NAMES:
+1. crown royal whisky
+2. jameson irish whiskey
+No explanation."""
             )
  
             # CALL 4: Quantities
             qty_text = claude_call(
                 client,
                 [qty_b64],
-                DIGIT_AMBIGUITY_GUIDE + "\n\nThis is a high-resolution crop of ONLY the order quantity column.\nQuantities are often multi-digit: 10, 14, 24 are common.\nReturn only a numbered list:\n1. 2\n2. 14\nNo explanation. Numbers only."
+                DIGIT_AMBIGUITY_GUIDE + """
+ 
+This is a high-resolution crop of ONLY the order quantity column.
+Read every quantity from top to bottom. Include ALL rows.
+Quantities are often multi-digit: 10, 14, 24 are common.
+Return only a numbered list:
+1. 2
+2. 14
+No explanation. Numbers only."""
             )
  
             # CALL 5: Prices and totals
             prices_text = claude_call(
                 client,
                 [price_b64, total_b64],
-                DIGIT_AMBIGUITY_GUIDE + "\n\nThese are high-resolution crops of the UNIT PRICE and TOTAL AMOUNT columns.\nReturn:\nUNIT PRICES:\n1. 38.99\n2. 31.99\nTOTALS:\n1. 77.98\n2. 447.86\nGRAND_TOTAL: 5763.74\nNo explanation. Numbers only."
+                DIGIT_AMBIGUITY_GUIDE + """
+ 
+These are high-resolution crops of the UNIT PRICE and TOTAL AMOUNT columns.
+Read every value from top to bottom. Include ALL rows.
+Return:
+UNIT PRICES:
+1. 38.99
+2. 31.99
+TOTALS:
+1. 77.98
+2. 447.86
+GRAND_TOTAL: 5763.74
+No explanation. Numbers only."""
             )
  
-            # Build merge prompt
+            # Merge prompt
             merge_prompt = "You are merging data from a Virginia ABC invoice read in separate passes.\n\n"
             merge_prompt += "PRODUCT CODES:\n" + codes_text + "\n\n"
             merge_prompt += "NAMES AND DOCUMENT INFO:\n" + names_text + "\n\n"
             merge_prompt += "QUANTITIES:\n" + qty_text + "\n\n"
             merge_prompt += "UNIT PRICES AND TOTALS:\n" + prices_text + "\n\n"
-            merge_prompt += reference_list + "\n\n"
-            merge_prompt += "Match row 1 code with row 1 name with row 1 qty with row 1 price with row 1 total, etc.\n"
+            merge_prompt += "CRITICAL: You must include ALL line items. Match row 1 code with row 1 name with row 1 qty etc.\n"
+            merge_prompt += "Do not skip any rows. The number of output rows must equal the number of product codes listed above.\n"
             merge_prompt += "For every row verify: Qty x Unit Price = Total. If not, use Total / Unit Price to correct Qty.\n"
             merge_prompt += "Extract document number and date from NAMES AND DOCUMENT INFO. If date is NONE use: " + upload_date + "\n\n"
-            merge_prompt += "Return as CSV:\nVendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n\n"
+            merge_prompt += "Return as CSV with these exact columns:\n"
+            merge_prompt += "Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n\n"
             merge_prompt += "Vendor=VA ABC, Location=" + str(location_code) + ", UofM=Bottle for 750ml/Liter for 1L/Each otherwise, "
             merge_prompt += "Qty=X.00, no $ signs, Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + "\n\n"
-            merge_prompt += "After last row add: GRAND_TOTAL:[number only]\nNo header. No explanation. No markdown."
+            merge_prompt += "After last row add: GRAND_TOTAL:[number only]\n"
+            merge_prompt += "No header row. No explanation. No markdown."
  
             final_text = claude_text_call(client, merge_prompt)
  
@@ -451,15 +404,15 @@ No explanation. JSON only."""
                 betas=["pdfs-2024-09-25"],
                 messages=[{"role": "user", "content": [
                     {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": file_base64}},
-                    {"type": "text", "text": "Extract all line items as CSV: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location. Vendor=VA ABC, Location=" + str(location_code) + ", Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + ", Date=" + upload_date + " if not found. Add GRAND_TOTAL at end. No markdown."}
+                    {"type": "text", "text": "Extract ALL line items as CSV: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location. Vendor=VA ABC, Location=" + str(location_code) + ", Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + ", Date=" + upload_date + " if not found. Add GRAND_TOTAL at end. No header. No markdown."}
                 ]}]
             )
             final_text = msg.content[0].text.strip()
  
     else:
         file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
-        receipt_prompt = DIGIT_AMBIGUITY_GUIDE + "\n" + reference_list + "\n"
-        receipt_prompt += "Extract all line items from this Virginia ABC receipt as CSV.\n"
+        receipt_prompt = DIGIT_AMBIGUITY_GUIDE + "\n"
+        receipt_prompt += "Extract ALL line items from this Virginia ABC receipt as CSV.\n"
         receipt_prompt += "Columns: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n"
         receipt_prompt += "Vendor=VA ABC, Location=" + str(location_code) + ", Date=" + upload_date + " if not found, Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + "\n"
         receipt_prompt += "Add GRAND_TOTAL:[number] at end. No header. No explanation. No markdown."
@@ -484,7 +437,6 @@ No explanation. JSON only."""
  
     csv_text = '\n'.join(csv_lines)
     fixed_csv, flagged, calculated_total = validate_and_fix_csv(csv_text, invoice_total)
-    update_items_db(fixed_csv)
  
     try:
         first_data_line = [l for l in fixed_csv.split('\n') if l and not l.startswith('Vendor,')][0]
@@ -502,10 +454,10 @@ No explanation. JSON only."""
     try:
         r365_response = push_to_r365(fixed_csv, location_code, file_url)
         r365_status = "success"
-        flagged.append(f"R365 API: Invoice pushed successfully")
+        flagged.append("R365 API: Invoice pushed successfully")
     except Exception as e:
         r365_status = f"R365 API error: {str(e)}"
-        flagged.append(f"R365 API failed: {str(e)} — falling back to FTP")
+        flagged.append(f"R365 API failed: {str(e)} - falling back to FTP")
         try:
             upload_to_ftp(filename, fixed_csv)
             ftp_status = "success"
@@ -521,10 +473,10 @@ No explanation. JSON only."""
         "ftp_status": ftp_status,
         "calculated_total": calculated_total,
         "claude_read_total": invoice_total,
-        "flagged": flagged,
-        "known_items_in_db": len(known_items)
+        "flagged": flagged
     })
  
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
+
  
