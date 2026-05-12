@@ -369,10 +369,21 @@ No explanation. Numbers only. Same count as product codes.""")
             final_text = msg.content[0].text.strip()
 
     else:
-        file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+        # Resize image if over 4MB
+        try:
+            img = Image.open(io.BytesIO(file_bytes))
+            img.thumbnail((1800, 1800), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=85)
+            file_base64 = base64.standard_b64encode(buf.getvalue()).decode('utf-8')
+            media_type = 'image/jpeg'
+        except Exception:
+            file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+            media_type = content_type or 'image/jpeg'
+
         client = anthropic.Anthropic(api_key=api_key)
         receipt_prompt = DIGIT_AMBIGUITY_GUIDE + "\n"
-        receipt_prompt += "Extract ALL line items from this Virginia ABC receipt as CSV.\n"
+        receipt_prompt += "Extract ALL line items from this Virginia ABC invoice or receipt as CSV.\n"
         receipt_prompt += "Columns: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n"
         receipt_prompt += "Vendor=VA ABC, Location=" + str(location_code) + ", Date=" + upload_date + " if not found, Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + "\n"
         receipt_prompt += "Add GRAND_TOTAL:[number] at end. No header. No explanation. No markdown."
@@ -381,7 +392,7 @@ No explanation. Numbers only. Same count as product codes.""")
             model="claude-sonnet-4-6",
             max_tokens=4096,
             messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": content_type or "image/jpeg", "data": file_base64}},
+                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": file_base64}},
                 {"type": "text", "text": receipt_prompt}
             ]}]
         )
