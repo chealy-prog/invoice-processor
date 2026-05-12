@@ -4,6 +4,7 @@ import httpx
 import ftplib
 import io
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify
 from datetime import datetime
 from pdf2image import convert_from_bytes
@@ -52,17 +53,18 @@ def prepare_pages(pdf_bytes):
     Image.MAX_IMAGE_PIXELS = None
     images = convert_from_bytes(pdf_bytes, dpi=200)
     num_pages = len(images)
-    pages = []
+    page_b64s = []
     for img in images:
         if num_pages > 1:
             thumb = img.copy()
             thumb.thumbnail((1600, 1600), Image.LANCZOS)
-            pages.append((img_to_b64(thumb, quality=75), thumb.size))
+            page_b64s.append(img_to_b64(thumb, quality=75))
         else:
-            pages.append((img_to_b64(img, quality=90), img.size))
-    return images, pages
+            page_b64s.append(img_to_b64(img, quality=90))
+    return page_b64s
 
-def claude_call(client, images, prompt, max_tokens=2048):
+def claude_call(api_key, images, prompt, max_tokens=2048):
+    client = anthropic.Anthropic(api_key=api_key)
     content = []
     for img in images:
         content.append({
@@ -77,7 +79,8 @@ def claude_call(client, images, prompt, max_tokens=2048):
     )
     return msg.content[0].text.strip()
 
-def claude_text_call(client, prompt, max_tokens=4096):
+def claude_text_call(api_key, prompt, max_tokens=4096):
+    client = anthropic.Anthropic(api_key=api_key)
     msg = client.messages.create(
         model="claude-sonnet-4-6",
         max_tokens=max_tokens,
@@ -173,7 +176,6 @@ def push_to_r365(csv_text, location_code, file_url):
     ap_invoices = []
     doc_number = None
     invoice_date = None
-    invoice_amount = 0.0
 
     for line in lines:
         if not line.strip() or line.startswith('Vendor,'):
@@ -186,7 +188,6 @@ def push_to_r365(csv_text, location_code, file_url):
             invoice_date = cols[3].strip()
         try:
             extended_price = float(cols[9].strip())
-            invoice_amount += extended_price
             ap_invoices.append({
                 "Vendor_Name": "VA ABC",
                 "Retailer_Store_Number": str(location_code),
@@ -244,128 +245,55 @@ def process_invoice():
     file_bytes = file_response.content
     content_type = file_response.headers.get('content-type', '')
 
-    client = anthropic.Anthropic(api_key=api_key)
-
     is_pdf = 'pdf' in content_type or file_url.lower().endswith('.pdf')
 
     if is_pdf:
         try:
-            raw_images, pages = prepare_pages(file_bytes)
-            page_b64s = [p[0] for p in pages]
+            page_b64s = prepare_pages(file_bytes)
 
-            # CALL 1: Detect column boundaries
-            detect_prompt = "This is a Virginia ABC invoice or receipt image.\n"
-            detect_prompt += "Image dimensions: " + str(raw_images[0].size[0]) + "x" + str(raw_images[0].size[1]) + " pixels.\n"
-            detect_prompt += """Identify the exact pixel boundaries of these columns on the first page:
-- product_code: column with 6-digit item/product codes
-- product_name: column with product names
-- qty: column with order quantities
-- unit_price: column with unit prices
-- total: column with total amounts
-- data_top: y pixel where data rows start (after header)
-- data_bottom: y pixel where data rows end (before footer/totals row)
+            # Define all 4 parallel calls
+            def call_codes():
+                return claude_call(api_key, page_b64s,
+                    DIGIT_AMBIGUITY_GUIDE + """
 
-Return ONLY valid JSON:
-{
-  "product_code": {"x1": 50, "x2": 150},
-  "product_name": {"x1": 155, "x2": 400},
-  "qty": {"x1": 405, "x2": 480},
-  "unit_price": {"x1": 485, "x2": 580},
-  "total": {"x1": 585, "x2": 700},
-  "data_top": 120,
-  "data_bottom": 900
-}
-No explanation. JSON only."""
-
-            bounds_text = claude_call(client, [page_b64s[0]], detect_prompt, max_tokens=500)
-
-            try:
-                bounds_text = bounds_text.replace('```json', '').replace('```', '').strip()
-                bounds = json.loads(bounds_text)
-            except Exception as e:
-                print(f"Bounds parse error: {e}, using fallback")
-                w_img, h_img = raw_images[0].size
-                bounds = {
-                    "product_code": {"x1": 0, "x2": int(w_img * 0.15)},
-                    "product_name": {"x1": int(w_img * 0.15), "x2": int(w_img * 0.55)},
-                    "qty": {"x1": int(w_img * 0.55), "x2": int(w_img * 0.65)},
-                    "unit_price": {"x1": int(w_img * 0.65), "x2": int(w_img * 0.80)},
-                    "total": {"x1": int(w_img * 0.80), "x2": w_img},
-                    "data_top": int(h_img * 0.10),
-                    "data_bottom": int(h_img * 0.95)
-                }
-
-            img = raw_images[0]
-            w, h = img.size
-            top = max(0, bounds.get('data_top', int(h * 0.10)))
-            bottom = min(h, bounds.get('data_bottom', int(h * 0.95)))
-
-            def make_crop(col_key, scale=3):
-                col = bounds.get(col_key, {})
-                x1 = max(0, col.get('x1', 0))
-                x2 = min(w, col.get('x2', w))
-                crop = img.crop((x1, top, x2, bottom))
-                crop = crop.resize((crop.width * scale, crop.height * scale), Image.LANCZOS)
-                return img_to_b64(crop, quality=97)
-
-            codes_b64 = make_crop('product_code', scale=4)
-            qty_b64 = make_crop('qty', scale=4)
-            price_b64 = make_crop('unit_price', scale=4)
-            total_b64 = make_crop('total', scale=4)
-
-            # CALL 2: Product codes
-            codes_text = claude_call(
-                client,
-                [codes_b64],
-                DIGIT_AMBIGUITY_GUIDE + """
-
-This is a high-resolution crop of ONLY the product code column from a Virginia ABC invoice.
-Read every product code from top to bottom. There may be items on multiple pages.
-Return only a numbered list:
+This is a Virginia ABC invoice. Look at the PRODUCT CODE column only (leftmost column with 6-digit numbers).
+Read every product code from top to bottom across ALL pages.
+Return ONLY a numbered list:
 1. 011297
 2. 015626
-No explanation. Numbers only."""
-            )
+No explanation. Numbers only.""")
 
-            # CALL 3: Names + doc info
-            names_text = claude_call(
-                client,
-                page_b64s,
-                """This is a Virginia ABC invoice or receipt.
-Read every product name from top to bottom. Include ALL items on ALL pages.
-Also find the document/order number and date.
-Return:
+            def call_names_and_meta():
+                return claude_call(api_key, page_b64s,
+                    """This is a Virginia ABC invoice.
+Read every PRODUCT NAME from top to bottom across ALL pages.
+Also find the document/order number and pickup date.
+Return exactly:
 DOCUMENT_NUMBER: [number]
 DATE: [date or NONE]
 NAMES:
 1. crown royal whisky
 2. jameson irish whiskey
-No explanation."""
-            )
+No explanation. Same count as product codes.""")
 
-            # CALL 4: Quantities
-            qty_text = claude_call(
-                client,
-                [qty_b64],
-                DIGIT_AMBIGUITY_GUIDE + """
+            def call_qty():
+                return claude_call(api_key, page_b64s,
+                    DIGIT_AMBIGUITY_GUIDE + """
 
-This is a high-resolution crop of ONLY the order quantity column.
-Read every quantity from top to bottom. Include ALL rows.
-Quantities are often multi-digit: 10, 14, 24 are common.
-Return only a numbered list:
+This is a Virginia ABC invoice. Look at the ORDER QTY column only.
+Read every quantity from top to bottom across ALL pages.
+Quantities are often multi-digit: 10, 14, 24 are common. Read carefully.
+Return ONLY a numbered list:
 1. 2
 2. 14
-No explanation. Numbers only."""
-            )
+No explanation. Numbers only. Same count as product codes.""")
 
-            # CALL 5: Prices and totals
-            prices_text = claude_call(
-                client,
-                [price_b64, total_b64],
-                DIGIT_AMBIGUITY_GUIDE + """
+            def call_prices():
+                return claude_call(api_key, page_b64s,
+                    DIGIT_AMBIGUITY_GUIDE + """
 
-These are high-resolution crops of the UNIT PRICE and TOTAL AMOUNT columns.
-Read every value from top to bottom. Include ALL rows.
+This is a Virginia ABC invoice. Look at the UNIT PRICE and TOTAL AMOUNT columns only.
+Read every value from top to bottom across ALL pages.
 Return:
 UNIT PRICES:
 1. 38.99
@@ -374,31 +302,53 @@ TOTALS:
 1. 77.98
 2. 447.86
 GRAND_TOTAL: 5763.74
-No explanation. Numbers only."""
-            )
+No explanation. Numbers only. Same count as product codes.""")
 
-            # Merge prompt
+            # Run all 4 calls in parallel
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                futures = {
+                    executor.submit(call_codes): 'codes',
+                    executor.submit(call_names_and_meta): 'names',
+                    executor.submit(call_qty): 'qty',
+                    executor.submit(call_prices): 'prices',
+                }
+                results = {}
+                for future in as_completed(futures):
+                    key = futures[future]
+                    results[key] = future.result()
+
+            codes_text = results['codes']
+            names_text = results['names']
+            qty_text = results['qty']
+            prices_text = results['prices']
+
+            # Count rows from codes to validate other columns
+            code_count = len([l for l in codes_text.strip().split('\n') if l.strip() and l[0].isdigit()])
+
+            # Merge call (text only - fast)
             merge_prompt = "You are merging data from a Virginia ABC invoice read in separate passes.\n\n"
-            merge_prompt += "PRODUCT CODES:\n" + codes_text + "\n\n"
+            merge_prompt += f"PRODUCT CODES ({code_count} items):\n" + codes_text + "\n\n"
             merge_prompt += "NAMES AND DOCUMENT INFO:\n" + names_text + "\n\n"
             merge_prompt += "QUANTITIES:\n" + qty_text + "\n\n"
             merge_prompt += "UNIT PRICES AND TOTALS:\n" + prices_text + "\n\n"
-            merge_prompt += "CRITICAL: You must include ALL line items. Match row 1 code with row 1 name with row 1 qty etc.\n"
-            merge_prompt += "Do not skip any rows. The number of output rows must equal the number of product codes listed above.\n"
+            merge_prompt += f"CRITICAL: Output must have exactly {code_count} data rows — one per product code.\n"
+            merge_prompt += "Match by position: row 1 code + row 1 name + row 1 qty + row 1 price + row 1 total.\n"
+            merge_prompt += "If any column has fewer items than codes, flag it but still output all rows.\n"
             merge_prompt += "For every row verify: Qty x Unit Price = Total. If not, use Total / Unit Price to correct Qty.\n"
-            merge_prompt += "Extract document number and date from NAMES AND DOCUMENT INFO. If date is NONE use: " + upload_date + "\n\n"
-            merge_prompt += "Return as CSV with these exact columns:\n"
+            merge_prompt += "Extract document number and date. If date is NONE use: " + upload_date + "\n\n"
+            merge_prompt += "Return as CSV:\n"
             merge_prompt += "Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n\n"
             merge_prompt += "Vendor=VA ABC, Location=" + str(location_code) + ", UofM=Bottle for 750ml/Liter for 1L/Each otherwise, "
             merge_prompt += "Qty=X.00, no $ signs, Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + "\n\n"
             merge_prompt += "After last row add: GRAND_TOTAL:[number only]\n"
             merge_prompt += "No header row. No explanation. No markdown."
 
-            final_text = claude_text_call(client, merge_prompt)
+            final_text = claude_text_call(api_key, merge_prompt)
 
         except Exception as e:
             print(f"Multi-call failed: {e}, falling back to PDF beta")
             file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+            client = anthropic.Anthropic(api_key=api_key)
             msg = client.beta.messages.create(
                 model="claude-sonnet-4-6",
                 max_tokens=4096,
@@ -412,6 +362,7 @@ No explanation. Numbers only."""
 
     else:
         file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+        client = anthropic.Anthropic(api_key=api_key)
         receipt_prompt = DIGIT_AMBIGUITY_GUIDE + "\n"
         receipt_prompt += "Extract ALL line items from this Virginia ABC receipt as CSV.\n"
         receipt_prompt += "Columns: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n"
@@ -448,7 +399,6 @@ No explanation. Numbers only."""
     except Exception:
         filename = "Colin_Export_VABC_invoice.csv"
 
-    # Try R365 API first, fall back to FTP
     r365_status = "not attempted"
     ftp_status = "not attempted"
 
