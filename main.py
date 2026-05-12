@@ -4,6 +4,9 @@ import httpx
 import ftplib
 import io
 import json
+import cv2
+import numpy as np
+import pytesseract
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, jsonify
 from datetime import datetime
@@ -44,6 +47,88 @@ DIGIT AMBIGUITY REFERENCE LIST:
 In numeric fields never use letters: always 0 not O, 1 not l/I, 5 not S, 8 not B.
 """
 
+# ── Image preprocessing ──────────────────────────────────────────────────────
+
+def detect_rotation_osd(gray):
+    try:
+        img_pil = Image.fromarray(gray)
+        osd = pytesseract.image_to_osd(img_pil, output_type=pytesseract.Output.DICT)
+        angle = osd.get('rotate', 0)
+        confidence = osd.get('orientation_conf', 0)
+        print(f"OSD: rotate={angle}, confidence={confidence:.2f}")
+        return angle, confidence
+    except Exception as e:
+        print(f"OSD failed: {e}")
+        return 0, 0
+
+def auto_rotate(gray):
+    h, w = gray.shape
+    if w > h * 1.2:
+        print("Landscape -> rotating 90 CW")
+        gray = cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)
+    angle, confidence = detect_rotation_osd(gray)
+    if confidence > 1.0 and angle != 0:
+        print(f"OSD correction: {angle} degrees")
+        if angle == 90:
+            gray = cv2.rotate(gray, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        elif angle == 180:
+            gray = cv2.rotate(gray, cv2.ROTATE_180)
+        elif angle == 270:
+            gray = cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)
+    return gray
+
+def deskew_fine(gray):
+    try:
+        edges = cv2.Canny(gray, 50, 150, apertureSize=3)
+        lines = cv2.HoughLinesP(edges, 1, np.pi/180, threshold=100,
+                                minLineLength=gray.shape[1]*0.25, maxLineGap=20)
+        if lines is None:
+            return gray
+        angles = []
+        for line in lines:
+            x1, y1, x2, y2 = line[0]
+            if x2 == x1:
+                continue
+            angle = np.degrees(np.arctan2(y2-y1, x2-x1))
+            if -15 < angle < 15:
+                angles.append(angle)
+        if not angles:
+            return gray
+        median_angle = np.median(angles)
+        if abs(median_angle) < 0.3:
+            return gray
+        print(f"Fine deskew: {median_angle:.2f} degrees")
+        h, w = gray.shape
+        M = cv2.getRotationMatrix2D((w//2, h//2), median_angle, 1.0)
+        return cv2.warpAffine(gray, M, (w, h), flags=cv2.INTER_CUBIC,
+                              borderMode=cv2.BORDER_REPLICATE)
+    except Exception as e:
+        print(f"Deskew error: {e}")
+        return gray
+
+def preprocess_image(img_pil):
+    """Full preprocessing pipeline: rotate, deskew, enhance, binarize."""
+    img = np.array(img_pil.convert('RGB'))
+    img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    print(f"Original: {gray.shape[1]}x{gray.shape[0]}")
+    gray = auto_rotate(gray)
+    gray = deskew_fine(gray)
+    print(f"After correction: {gray.shape[1]}x{gray.shape[0]}")
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    gray = clahe.apply(gray)
+    gray = cv2.fastNlMeansDenoising(gray, h=8)
+    binary = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY,
+        25, 8
+    )
+    result = Image.fromarray(binary)
+    result.thumbnail((2500, 2500), Image.LANCZOS)
+    print(f"Final: {result.size}")
+    return result
+
 def img_to_b64(img, quality=90):
     buf = io.BytesIO()
     img.save(buf, format='JPEG', quality=quality)
@@ -51,17 +136,23 @@ def img_to_b64(img, quality=90):
 
 def prepare_pages(pdf_bytes):
     Image.MAX_IMAGE_PIXELS = None
-    images = convert_from_bytes(pdf_bytes, dpi=150)
-    num_pages = len(images)
+    images = convert_from_bytes(pdf_bytes, dpi=250)
     page_b64s = []
-    for img in images:
-        # Always resize to fit within Claude 5MB limit
-        max_dimension = 1800 if num_pages == 1 else 1400
-        if img.width > max_dimension or img.height > max_dimension:
-            img.thumbnail((max_dimension, max_dimension), Image.LANCZOS)
-        quality = 85 if num_pages == 1 else 70
-        page_b64s.append(img_to_b64(img, quality=quality))
+    for i, img in enumerate(images):
+        print(f"Preprocessing page {i+1}/{len(images)}")
+        processed = preprocess_image(img)
+        b64 = img_to_b64(processed, quality=92)
+        size_kb = len(base64.b64decode(b64)) / 1024
+        print(f"Page {i+1}: {size_kb:.0f}KB")
+        page_b64s.append(b64)
     return page_b64s
+
+def prepare_image(file_bytes):
+    img = Image.open(io.BytesIO(file_bytes))
+    processed = preprocess_image(img)
+    return img_to_b64(processed, quality=92)
+
+# ── Claude calls ─────────────────────────────────────────────────────────────
 
 def claude_call(api_key, images, prompt, max_tokens=2048):
     client = anthropic.Anthropic(api_key=api_key)
@@ -87,6 +178,8 @@ def claude_text_call(api_key, prompt, max_tokens=4096):
         messages=[{"role": "user", "content": [{"type": "text", "text": prompt}]}]
     )
     return msg.content[0].text.strip()
+
+# ── Validation ────────────────────────────────────────────────────────────────
 
 def could_be_misread(read_value, calculated_value):
     read_str = f"{read_value:.2f}"
@@ -159,6 +252,8 @@ def validate_and_fix_csv(csv_text, invoice_total=None):
 
     return '\n'.join(fixed_lines), flagged, round(running_total, 2)
 
+# ── R365 / FTP ────────────────────────────────────────────────────────────────
+
 def get_r365_token():
     resp = httpx.post(
         f"{R365_URL}/APIv1/Authenticate/JWT",
@@ -223,10 +318,7 @@ def push_to_r365(csv_text, location_code, file_url):
     resp = httpx.post(
         f"{R365_URL}/APIv1/APInvoices",
         json=payload,
-        headers={
-            "Authorization": token,
-            "Content-Type": "application/json"
-        },
+        headers={"Authorization": token, "Content-Type": "application/json"},
         timeout=60
     )
     resp.raise_for_status()
@@ -240,6 +332,8 @@ def upload_to_ftp(filename, content):
     ftp.cwd(FTP_DIR)
     ftp.storbinary(f'STOR {filename}', io.BytesIO(content.encode('utf-8')))
     ftp.quit()
+
+# ── Main route ────────────────────────────────────────────────────────────────
 
 @app.route('/process', methods=['POST'])
 def process_invoice():
@@ -258,50 +352,79 @@ def process_invoice():
     if is_pdf:
         try:
             page_b64s = prepare_pages(file_bytes)
+        except Exception as e:
+            print(f"PDF preprocessing failed: {e}")
+            file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
+            page_b64s = [file_base64]
+    else:
+        try:
+            page_b64s = [prepare_image(file_bytes)]
+        except Exception as e:
+            print(f"Image preprocessing failed: {e}")
+            img = Image.open(io.BytesIO(file_bytes)).convert('RGB')
+            img.thumbnail((2000, 2000), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=85)
+            page_b64s = [base64.standard_b64encode(buf.getvalue()).decode('utf-8')]
 
-            # Define all 4 parallel calls
-            def call_codes():
-                return claude_call(api_key, page_b64s,
-                    DIGIT_AMBIGUITY_GUIDE + """
+    try:
+        # 4 parallel Claude calls
+        def call_codes():
+            return claude_call(api_key, page_b64s,
+                DIGIT_AMBIGUITY_GUIDE + """
 
-This is a Virginia ABC invoice. Look at the PRODUCT CODE column only (leftmost column with 6-digit numbers).
-Read every product code from top to bottom across ALL pages.
+This is a preprocessed Virginia ABC invoice image.
+Look ONLY at the PRODUCT CODE column (leftmost column with 6-digit numbers).
+
+IMPORTANT: Some invoices have faint ghost numbers that are lighter than real codes
+and appear on rows with NO corresponding product name. Ignore these ghost codes entirely.
+Only include product codes that have a clear, dark product name on the same row.
+
+Read every REAL product code top to bottom across ALL pages.
 Return ONLY a numbered list:
 1. 011297
 2. 015626
 No explanation. Numbers only.""")
 
-            def call_names_and_meta():
-                return claude_call(api_key, page_b64s,
-                    """This is a Virginia ABC invoice.
+        def call_names_and_meta():
+            return claude_call(api_key, page_b64s,
+                """This is a preprocessed Virginia ABC invoice image.
 Read every PRODUCT NAME from top to bottom across ALL pages.
 Also find the document/order number and pickup date.
+
+IMPORTANT: Only include product names that are clearly printed and dark.
+Ignore any faint ghost text. Every name must correspond to a real line item.
+
 Return exactly:
 DOCUMENT_NUMBER: [number]
 DATE: [date or NONE]
 NAMES:
 1. crown royal whisky
 2. jameson irish whiskey
-No explanation. Same count as product codes.""")
+No explanation. Same count as real product codes.""")
 
-            def call_qty():
-                return claude_call(api_key, page_b64s,
-                    DIGIT_AMBIGUITY_GUIDE + """
+        def call_qty():
+            return claude_call(api_key, page_b64s,
+                DIGIT_AMBIGUITY_GUIDE + """
 
-This is a Virginia ABC invoice. Look at the ORDER QTY column only.
-Read every quantity from top to bottom across ALL pages.
-Quantities are often multi-digit: 10, 14, 24 are common. Read carefully.
+This is a preprocessed Virginia ABC invoice image.
+Look ONLY at the ORDER QTY column.
+Read every quantity top to bottom across ALL pages.
+Only include quantities that correspond to real line items with a product name.
+Quantities are often multi-digit: 10, 14, 24, 48, 72 are common.
 Return ONLY a numbered list:
 1. 2
 2. 14
 No explanation. Numbers only. Same count as product codes.""")
 
-            def call_prices():
-                return claude_call(api_key, page_b64s,
-                    DIGIT_AMBIGUITY_GUIDE + """
+        def call_prices():
+            return claude_call(api_key, page_b64s,
+                DIGIT_AMBIGUITY_GUIDE + """
 
-This is a Virginia ABC invoice. Look at the UNIT PRICE and TOTAL AMOUNT columns only.
-Read every value from top to bottom across ALL pages.
+This is a preprocessed Virginia ABC invoice image.
+Look ONLY at the UNIT PRICE and TOTAL AMOUNT columns.
+Read every value top to bottom across ALL pages.
+Only include values for real line items with a product name.
 Return:
 UNIT PRICES:
 1. 38.99
@@ -312,87 +435,54 @@ TOTALS:
 GRAND_TOTAL: 5763.74
 No explanation. Numbers only. Same count as product codes.""")
 
-            # Run all 4 calls in parallel
-            with ThreadPoolExecutor(max_workers=4) as executor:
-                futures = {
-                    executor.submit(call_codes): 'codes',
-                    executor.submit(call_names_and_meta): 'names',
-                    executor.submit(call_qty): 'qty',
-                    executor.submit(call_prices): 'prices',
-                }
-                results = {}
-                for future in as_completed(futures):
-                    key = futures[future]
-                    results[key] = future.result()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                executor.submit(call_codes): 'codes',
+                executor.submit(call_names_and_meta): 'names',
+                executor.submit(call_qty): 'qty',
+                executor.submit(call_prices): 'prices',
+            }
+            results = {}
+            for future in as_completed(futures):
+                key = futures[future]
+                results[key] = future.result()
 
-            codes_text = results['codes']
-            names_text = results['names']
-            qty_text = results['qty']
-            prices_text = results['prices']
+        codes_text = results['codes']
+        names_text = results['names']
+        qty_text = results['qty']
+        prices_text = results['prices']
 
-            # Count rows from codes to validate other columns
-            code_count = len([l for l in codes_text.strip().split('\n') if l.strip() and l[0].isdigit()])
+        code_count = len([l for l in codes_text.strip().split('\n') if l.strip() and l[0].isdigit()])
 
-            # Merge call (text only - fast)
-            merge_prompt = "You are merging data from a Virginia ABC invoice read in separate passes.\n\n"
-            merge_prompt += f"PRODUCT CODES ({code_count} items):\n" + codes_text + "\n\n"
-            merge_prompt += "NAMES AND DOCUMENT INFO:\n" + names_text + "\n\n"
-            merge_prompt += "QUANTITIES:\n" + qty_text + "\n\n"
-            merge_prompt += "UNIT PRICES AND TOTALS:\n" + prices_text + "\n\n"
-            merge_prompt += f"CRITICAL: Output must have exactly {code_count} data rows — one per product code.\n"
-            merge_prompt += "Match by position: row 1 code + row 1 name + row 1 qty + row 1 price + row 1 total.\n"
-            merge_prompt += "If any column has fewer items than codes, flag it but still output all rows.\n"
-            merge_prompt += "For every row verify: Qty x Unit Price = Total. If not, use Total / Unit Price to correct Qty.\n"
-            merge_prompt += "Extract document number and date. If date is NONE use: " + upload_date + "\n\n"
-            merge_prompt += "Return as CSV:\n"
-            merge_prompt += "Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n\n"
-            merge_prompt += "Vendor=VA ABC, Location=" + str(location_code) + ", UofM=Bottle for 750ml/Liter for 1L/Each otherwise, "
-            merge_prompt += "Qty=X.00, no $ signs, Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + "\n\n"
-            merge_prompt += "After last row add: GRAND_TOTAL:[number only]\n"
-            merge_prompt += "No header row. No explanation. No markdown."
+        merge_prompt = "You are merging data from a Virginia ABC invoice read in separate passes.\n\n"
+        merge_prompt += f"PRODUCT CODES ({code_count} real items):\n" + codes_text + "\n\n"
+        merge_prompt += "NAMES AND DOCUMENT INFO:\n" + names_text + "\n\n"
+        merge_prompt += "QUANTITIES:\n" + qty_text + "\n\n"
+        merge_prompt += "UNIT PRICES AND TOTALS:\n" + prices_text + "\n\n"
+        merge_prompt += f"CRITICAL: Output must have exactly {code_count} data rows.\n"
+        merge_prompt += "Match by position: row 1 code + row 1 name + row 1 qty + row 1 price + row 1 total.\n"
+        merge_prompt += "For every row verify: Qty x Unit Price = Total. If not, use Total / Unit Price to correct Qty.\n"
+        merge_prompt += "Extract document number and date. If date is NONE use: " + upload_date + "\n\n"
+        merge_prompt += "Return as CSV:\n"
+        merge_prompt += "Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n\n"
+        merge_prompt += "Vendor=VA ABC, Location=" + str(location_code) + ", UofM=Bottle for 750ml/Liter for 1L/Each otherwise, "
+        merge_prompt += "Qty=X.00, no $ signs, Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + "\n\n"
+        merge_prompt += "After last row add: GRAND_TOTAL:[number only]\n"
+        merge_prompt += "No header row. No explanation. No markdown."
 
-            final_text = claude_text_call(api_key, merge_prompt)
+        final_text = claude_text_call(api_key, merge_prompt)
 
-        except Exception as e:
-            print(f"Multi-call failed: {e}, falling back to PDF beta")
-            file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
-            client = anthropic.Anthropic(api_key=api_key)
-            msg = client.beta.messages.create(
-                model="claude-sonnet-4-6",
-                max_tokens=4096,
-                betas=["pdfs-2024-09-25"],
-                messages=[{"role": "user", "content": [
-                    {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": file_base64}},
-                    {"type": "text", "text": "Extract ALL line items as CSV: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location. Vendor=VA ABC, Location=" + str(location_code) + ", Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + ", Date=" + upload_date + " if not found. Add GRAND_TOTAL at end. No header. No markdown."}
-                ]}]
-            )
-            final_text = msg.content[0].text.strip()
-
-    else:
-        # Resize image to stay under 5MB
-        img = Image.open(io.BytesIO(file_bytes))
-        img = img.convert('RGB')
-        img.thumbnail((1800, 1800), Image.LANCZOS)
-        buf = io.BytesIO()
-        img.save(buf, format='JPEG', quality=85)
-        resized_bytes = buf.getvalue()
-        print(f"Resized image from {len(file_bytes)} to {len(resized_bytes)} bytes")
-        file_base64 = base64.standard_b64encode(resized_bytes).decode('utf-8')
-        media_type = 'image/jpeg'
-
+    except Exception as e:
+        print(f"Multi-call failed: {e}, falling back to PDF beta")
+        file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
         client = anthropic.Anthropic(api_key=api_key)
-        receipt_prompt = DIGIT_AMBIGUITY_GUIDE + "\n"
-        receipt_prompt += "Extract ALL line items from this Virginia ABC invoice or receipt as CSV.\n"
-        receipt_prompt += "Columns: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location\n"
-        receipt_prompt += "Vendor=VA ABC, Location=" + str(location_code) + ", Date=" + upload_date + " if not found, Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + "\n"
-        receipt_prompt += "Add GRAND_TOTAL:[number] at end. No header. No explanation. No markdown."
-
-        msg = client.messages.create(
+        msg = client.beta.messages.create(
             model="claude-sonnet-4-6",
             max_tokens=4096,
+            betas=["pdfs-2024-09-25"],
             messages=[{"role": "user", "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": file_base64}},
-                {"type": "text", "text": receipt_prompt}
+                {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": file_base64}},
+                {"type": "text", "text": "Extract ALL line items as CSV: Vendor,Location,Document Number,Date,Vendor Item Number,Vendor Item Name,UofM,Qty,Unit Price,Total,Image URL,Break Flag,Detail Location. Vendor=VA ABC, Location=" + str(location_code) + ", Image URL=" + file_url + ", Break Flag=N, Detail Location=" + str(location_code) + ", Date=" + upload_date + " if not found. Add GRAND_TOTAL at end. No header. No markdown."}
             ]}]
         )
         final_text = msg.content[0].text.strip()
@@ -421,7 +511,7 @@ No explanation. Numbers only. Same count as product codes.""")
     ftp_status = "not attempted"
 
     try:
-        r365_response = push_to_r365(fixed_csv, location_code, file_url)
+        push_to_r365(fixed_csv, location_code, file_url)
         r365_status = "success"
         flagged.append("R365 API: Invoice pushed successfully")
     except Exception as e:
