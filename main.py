@@ -199,6 +199,8 @@ def push_to_r365(csv_text, location_code, file_url):
             print(f"Skipping line: {e}")
             continue
 
+    invoice_total = sum(l["Extended_Price"] for l in invoice_lines)
+
     payload = {
         "BatchId": doc_number or "VABC_IMPORT",
         "userId": R365_USER,
@@ -207,10 +209,15 @@ def push_to_r365(csv_text, location_code, file_url):
             "Retailer_Store_Number": str(location_code),
             "Invoice_Date": invoice_date,
             "Invoice_Number": doc_number,
-            "Invoice_Amount": sum(l["Extended_Price"] for l in invoice_lines),
+            "Invoice_Amount": invoice_total,
             "Image_URL": file_url,
-            "Invoice_Line_Items": invoice_lines
-        }]
+            "Product_Number": l["Product_Number"],
+            "Quantity": l["Quantity"],
+            "Invoice_Line_Item_Cost": l["Invoice_Line_Item_Cost"],
+            "Extended_Price": l["Extended_Price"],
+            "Product_Description": l["Product_Description"],
+            "Unit_Of_Measure": l["Unit_Of_Measure"]
+        } for l in invoice_lines]
     }
 
     resp = httpx.post(
