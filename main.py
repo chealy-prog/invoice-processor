@@ -369,17 +369,16 @@ No explanation. Numbers only. Same count as product codes.""")
             final_text = msg.content[0].text.strip()
 
     else:
-        # Resize image if over 4MB
-        try:
-            img = Image.open(io.BytesIO(file_bytes))
-            img.thumbnail((1800, 1800), Image.LANCZOS)
-            buf = io.BytesIO()
-            img.save(buf, format='JPEG', quality=85)
-            file_base64 = base64.standard_b64encode(buf.getvalue()).decode('utf-8')
-            media_type = 'image/jpeg'
-        except Exception:
-            file_base64 = base64.standard_b64encode(file_bytes).decode('utf-8')
-            media_type = content_type or 'image/jpeg'
+        # Resize image to stay under 5MB
+        img = Image.open(io.BytesIO(file_bytes))
+        img = img.convert('RGB')
+        img.thumbnail((1800, 1800), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=85)
+        resized_bytes = buf.getvalue()
+        print(f"Resized image from {len(file_bytes)} to {len(resized_bytes)} bytes")
+        file_base64 = base64.standard_b64encode(resized_bytes).decode('utf-8')
+        media_type = 'image/jpeg'
 
         client = anthropic.Anthropic(api_key=api_key)
         receipt_prompt = DIGIT_AMBIGUITY_GUIDE + "\n"
