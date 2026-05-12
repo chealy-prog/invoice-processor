@@ -170,9 +170,10 @@ def get_r365_token():
 def push_to_r365(csv_text, location_code, file_url):
     token = get_r365_token()
     lines = csv_text.strip().split('\n')
-    invoice_lines = []
+    ap_invoices = []
     doc_number = None
     invoice_date = None
+    invoice_amount = 0.0
 
     for line in lines:
         if not line.strip() or line.startswith('Vendor,'):
@@ -184,11 +185,19 @@ def push_to_r365(csv_text, location_code, file_url):
             doc_number = cols[2].strip()
             invoice_date = cols[3].strip()
         try:
-            invoice_lines.append({
+            extended_price = float(cols[9].strip())
+            invoice_amount += extended_price
+            ap_invoices.append({
+                "Vendor_Name": "VA ABC",
+                "Retailer_Store_Number": str(location_code),
+                "Invoice_Date": invoice_date,
+                "Invoice_Number": doc_number,
+                "Invoice_Amount": extended_price,
+                "Image_URL": file_url,
                 "Product_Number": cols[4].strip(),
                 "Quantity": float(cols[7].strip()),
                 "Invoice_Line_Item_Cost": float(cols[8].strip()),
-                "Extended_Price": float(cols[9].strip()),
+                "Extended_Price": extended_price,
                 "Product_Description": cols[5].strip(),
                 "Unit_Of_Measure": cols[6].strip()
             })
@@ -196,17 +205,10 @@ def push_to_r365(csv_text, location_code, file_url):
             print(f"Skipping line: {e}")
             continue
 
-    # Single invoice with all line items grouped together
     payload = {
-        "apInvoices": [{
-            "Vendor_Name": "VA ABC",
-            "Retailer_Store_Number": str(location_code),
-            "Invoice_Date": invoice_date,
-            "Invoice_Number": doc_number,
-            "Invoice_Amount": sum(l["Extended_Price"] for l in invoice_lines),
-            "Image_URL": file_url,
-            "Invoice_Line_Items": invoice_lines
-        }]
+        "BatchId": doc_number or "VABC_IMPORT",
+        "userId": R365_USER,
+        "apInvoices": ap_invoices
     }
 
     resp = httpx.post(
