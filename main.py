@@ -535,5 +535,19 @@ No explanation. Numbers only. Same count as product codes.""")
         "flagged": flagged
     })
 
+
+@app.route('/test-odata', methods=['GET'])
+def test_odata():
+    try:
+        resp = httpx.get(
+            'https://odata.restaurant365.net/api/v2/views/Item',
+            auth=('housepitality\\housepitalityAPI', 'QCE7gdx0wbu_und6kuq'),
+            params={'$top': '5', '$select': 'itemId,itemNumber,category1,category2'},
+            timeout=15
+        )
+        return jsonify({"status": resp.status_code, "body": resp.text[:500]})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
