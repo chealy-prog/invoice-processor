@@ -606,5 +606,48 @@ def test_vendor_items():
         
     return jsonify(results)
 
+
+@app.route('/test-transaction-detail', methods=['GET'])
+def test_transaction_detail():
+    auth = ('housepitality\\housepitalityAPI', 'QCE7gdx0wbu_und6kuq')
+    VA_ABC_ID = '94eaeda7-3f25-e811-9401-0cc47abd03b6'
+    
+    try:
+        # First get recent AP Invoice transactions from VA ABC
+        resp = httpx.get(
+            'https://odata.restaurant365.net/api/v2/views/Transaction',
+            auth=auth,
+            params={
+                '$top': '5',
+                '$filter': f"type eq 'AP Invoice' and companyId eq {VA_ABC_ID}",
+                '$orderby': 'date desc',
+                '$select': 'transactionId,transactionNumber,name,date,type,companyId'
+            },
+            timeout=15
+        )
+        transactions = resp.json()
+        
+        # Get detail for first transaction
+        details = {}
+        if transactions.get('value'):
+            txn_id = transactions['value'][0]['transactionId']
+            det_resp = httpx.get(
+                'https://odata.restaurant365.net/api/v2/views/TransactionDetail',
+                auth=auth,
+                params={
+                    '$filter': f"transactionId eq {txn_id}",
+                    '$top': '5'
+                },
+                timeout=15
+            )
+            details = det_resp.json()
+        
+        return jsonify({
+            "transactions": transactions,
+            "sample_details": details
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
