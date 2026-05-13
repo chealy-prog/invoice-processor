@@ -539,13 +539,31 @@ No explanation. Numbers only. Same count as product codes.""")
 @app.route('/test-odata', methods=['GET'])
 def test_odata():
     try:
+        # Get all available fields first
         resp = httpx.get(
             'https://odata.restaurant365.net/api/v2/views/Item',
             auth=('housepitality\\housepitalityAPI', 'QCE7gdx0wbu_und6kuq'),
-            params={'$top': '5', '$select': 'itemId,itemNumber,category1,category2'},
+            params={'$top': '3'},
             timeout=15
         )
-        return jsonify({"status": resp.status_code, "body": resp.text[:500]})
+        return jsonify({"status": resp.status_code, "body": resp.json()})
+    except Exception as e:
+        return jsonify({"error": str(e)})
+
+@app.route('/test-odata-vabc', methods=['GET'])
+def test_odata_vabc():
+    try:
+        # Try to find VA ABC vendor items
+        resp = httpx.get(
+            'https://odata.restaurant365.net/api/v2/views/Item',
+            auth=('housepitality\\housepitalityAPI', 'QCE7gdx0wbu_und6kuq'),
+            params={
+                '$top': '10',
+                '$filter': "contains(category1,'Liquor') or contains(category1,'Beer') or contains(category1,'Wine') or contains(category2,'ABC')"
+            },
+            timeout=15
+        )
+        return jsonify({"status": resp.status_code, "body": resp.json()})
     except Exception as e:
         return jsonify({"error": str(e)})
 
