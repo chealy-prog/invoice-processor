@@ -613,13 +613,18 @@ def test_transaction_detail():
     VA_ABC_ID = '94eaeda7-3f25-e811-9401-0cc47abd03b6'
     
     try:
-        # First get recent AP Invoice transactions from VA ABC
+        from datetime import datetime, timedelta
+        end_date = datetime.utcnow()
+        start_date = end_date - timedelta(days=30)
+        date_filter = f"date ge {start_date.strftime('%Y-%m-%dT00:00:00Z')} and date le {end_date.strftime('%Y-%m-%dT23:59:59Z')}"
+        
+        # Get recent AP Invoice transactions from VA ABC
         resp = httpx.get(
             'https://odata.restaurant365.net/api/v2/views/Transaction',
             auth=auth,
             params={
                 '$top': '5',
-                '$filter': f"type eq 'AP Invoice' and companyId eq {VA_ABC_ID}",
+                '$filter': f"{date_filter} and type eq 'AP Invoice' and companyId eq {VA_ABC_ID}",
                 '$orderby': 'date desc',
                 '$select': 'transactionId,transactionNumber,name,date,type,companyId'
             },
@@ -636,7 +641,7 @@ def test_transaction_detail():
                 auth=auth,
                 params={
                     '$filter': f"transactionId eq {txn_id}",
-                    '$top': '5'
+                    '$top': '10'
                 },
                 timeout=15
             )
