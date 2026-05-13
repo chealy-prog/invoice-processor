@@ -553,19 +553,58 @@ def test_odata():
 @app.route('/test-odata-vabc', methods=['GET'])
 def test_odata_vabc():
     try:
-        # Try to find VA ABC vendor items
-        resp = httpx.get(
-            'https://odata.restaurant365.net/api/v2/views/Item',
-            auth=('housepitality\\housepitalityAPI', 'QCE7gdx0wbu_und6kuq'),
-            params={
-                '$top': '10',
-                '$filter': "contains(category1,'Liquor') or contains(category1,'Beer') or contains(category1,'Wine') or contains(category2,'ABC')"
-            },
-            timeout=15
-        )
-        return jsonify({"status": resp.status_code, "body": resp.json()})
+        # Search for items with 6-digit itemNumbers (VA ABC format)
+        results = []
+        url = 'https://odata.restaurant365.net/api/v2/views/Item'
+        params = {
+            '$top': '50',
+            '$select': 'itemId,itemNumber,name,category1,category2',
+            '$filter': "itemNumber ne null"
+        }
+        resp = httpx.get(url, auth=('housepitality\\housepitalityAPI', 'QCE7gdx0wbu_und6kuq'),
+                         params=params, timeout=15)
+        data = resp.json()
+        # Filter to 6-digit numeric codes (VA ABC format)
+        items = [i for i in data.get('value', []) 
+                 if i.get('itemNumber') and str(i['itemNumber']).isdigit() 
+                 and len(str(i['itemNumber'])) == 6]
+        return jsonify({"status": resp.status_code, "count": len(items), "sample": items[:10]})
     except Exception as e:
         return jsonify({"error": str(e)})
+
+
+@app.route('/test-vendor-items', methods=['GET'])
+def test_vendor_items():
+    results = {}
+    auth = ('housepitality\\housepitalityAPI', 'QCE7gdx0wbu_und6kuq')
+    
+    # Try various possible vendor item endpoint names
+    endpoints = ['VendorItem', 'VendorItems', 'ItemVendor', 'PurchaseItem', 'CompanyItem']
+    for ep in endpoints:
+        try:
+            resp = httpx.get(
+                f'https://odata.restaurant365.net/api/v2/views/{ep}',
+                auth=auth,
+                params={'$top': '2'},
+                timeout=10
+            )
+            results[ep] = {"status": resp.status_code, "body": resp.text[:200]}
+        except Exception as e:
+            results[ep] = {"error": str(e)}
+    
+    # Also try Company endpoint to find VA ABC vendor
+    try:
+        resp = httpx.get(
+            'https://odata.restaurant365.net/api/v2/views/Company',
+            auth=auth,
+            params={'$top': '5', '$filter': "contains(name,'ABC')"},
+            timeout=10
+        )
+        results['Company_ABC'] = {"status": resp.status_code, "body": resp.text[:500]}
+    except Exception as e:
+        results['Company_ABC'] = {"error": str(e)}
+        
+    return jsonify(results)
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=8080)
